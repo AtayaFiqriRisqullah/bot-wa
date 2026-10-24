@@ -1,3 +1,6 @@
+import json
+import os
+import threading
 from datetime import date, datetime, timedelta, timezone
 
 import gspread
@@ -25,12 +28,27 @@ KATEGORI = {
 BARIS_AWAL = 36     # baris data pertama tabel pengeluaran (baris 35 = TOTAL)
 BARIS_AKHIR = 500   # batas bawah saat membaca data
 
-# Tabel Pemasukan (kolom B-D) di tab bulanan.
+# Tabel Pemasukan (kolom B-D: Source/Date/Nilai).
 PEMASUKAN_BARIS_AWAL = 10    # baris 9 = "Sisa Bulanan", jangan ditimpa
 PEMASUKAN_BARIS_AKHIR = 31   # batas rumus saldo BNI (B10:B31)
 
+# Tabel Pemasukan Bank (kolom T-V: Source/Date/Nilai).
+PEMASUKAN_BANK_BARIS_AWAL = 10
+PEMASUKAN_BANK_BARIS_AKHIR = 31
+
+# Dua blok angka yang dibaca /saldo: label di kolom kiri, nilai di kolom kanan.
+# Kalau tabelnya bergeser, cukup ubah dua baris ini.
+RENTANG_HASIL_AKHIR = 'G9:H12'   # Pemasukan, Pengeluaran, Sisa Uang
+RENTANG_SALDO_BANK = 'K9:L12'    # Total, BNI, Mandiri
+
+# Riwayat catatan untuk /undo. Disimpan di file supaya tetap ada
+# walaupun bot dimatikan, dan hanya menyimpan RIWAYAT_MAKS catatan terakhir.
+RIWAYAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'riwayat.json')
+RIWAYAT_MAKS = 20
+
 _akun = gspread.service_account_from_dict(muat_kunci())
 _buku = _akun.open_by_key(SHEET_ID)
+_kunci_riwayat = threading.Lock()
 
 
 class TabTidakAda(Exception):
@@ -38,7 +56,13 @@ class TabTidakAda(Exception):
 
 
 class TabelPenuh(Exception):
-    """Dilempar kalau tabel Pemasukan sudah terisi sampai baris terakhir yang dihitung rumus."""
+    """Dilempar kalau sebuah tabel sudah terisi sampai baris terakhir yang dihitung rumus.
+    Isi pesannya adalah nama tabelnya, misalnya 'Pemasukan'."""
+
+
+class RiwayatBerubah(Exception):
+    """Dilempar kalau isi sel sudah tidak sama dengan yang ditulis bot,
+    jadi /undo tidak berani menghapusnya. Isi pesannya adalah ringkasan catatannya."""
 
 
 def sekarang():
@@ -71,7 +95,15 @@ def _baris_kosong(ws, kolom):
     return baris
 
 
-def simpan_pengeluaran(kategori, nama, nominal):
+def _catat_jejak(jejak, ws, rentang, nama, nominal):
+    """Kalau pemanggil menyiapkan daftar jejak, catat apa yang baru ditulis
+    (dipakai /undo untuk tahu sel mana yang harus dikosongkan)."""
+    if jejak is not None:
+        jejak.append({'tab': ws.title, 'rentang': rentang,
+                      'nama': str(nama), 'nominal': nominal})
+
+
+def simpan_pengeluaran(kategori, nama, nominal, jejak=None):
     """Tulis satu pengeluaran ke tabel kategori di tab bulan ini.
 
     Mengembalikan (nama tab, nomor baris) supaya bisa dilaporkan ke pengguna.
@@ -79,30 +111,73 @@ def simpan_pengeluaran(kategori, nama, nominal):
     ws = _tab_bulan()
     kolom_awal, kolom_akhir = KATEGORI[kategori]
     baris = _baris_kosong(ws, kolom_awal)
+    nama_tulis = nama
     if nama and nama[0] in '=+-@':
-        nama = "'" + nama     # cegah teks dibaca sebagai rumus
+        nama_tulis = "'" + nama     # cegah teks dibaca sebagai rumus
+    rentang = f'{kolom_awal}{baris}:{kolom_akhir}{baris}'
     # raw=False: tanggal '2026-10-13' dibaca Sheets sebagai tanggal asli,
     # dan formatnya mengikuti format sel (misalnya 13/10/2026).
-    ws.update(range_name=f'{kolom_awal}{baris}:{kolom_akhir}{baris}',
-              values=[[nama, _tanggal(), nominal]], raw=False)
+    ws.update(range_name=rentang,
+              values=[[nama_tulis, _tanggal(), nominal]], raw=False)
+    _catat_jejak(jejak, ws, rentang, nama, nominal)
     return ws.title, baris
 
 
-def simpan_pemasukan(sumber, nominal):
-    """Isi baris kosong pertama di tabel Pemasukan (kolom B-D) pada tab bulan ini.
+def _tulis_ke_tabel(ws, kolom_awal, kolom_akhir, baris_awal, baris_akhir,
+                    nama_tabel, nama, nominal, jejak):
+    """Isi baris kosong pertama di tabel (nama / tanggal hari ini / nominal)."""
+    nomor_kolom = a1_to_rowcol(kolom_awal + '1')[1]
+    isi = ws.col_values(nomor_kolom)      # indeks 0 = baris 1; sel kosong = ''
+    for baris in range(baris_awal, baris_akhir + 1):
+        if baris > len(isi) or isi[baris - 1].strip() == '':
+            break
+    else:
+        raise TabelPenuh(nama_tabel)
+    rentang = f'{kolom_awal}{baris}:{kolom_akhir}{baris}'
+    ws.update(range_name=rentang,
+              values=[[nama, _tanggal(), nominal]], raw=False)
+    _catat_jejak(jejak, ws, rentang, nama, nominal)
+    return baris
+
+
+def simpan_pemasukan(sumber, nominal, jejak=None):
+    """Tulis satu baris ke tabel Pemasukan (B-D) pada tab bulan ini.
 
     Mengembalikan (nama tab, nomor baris).
     """
     ws = _tab_bulan()                     # melempar TabTidakAda kalau tab belum ada
-    isi = ws.col_values(2)                # kolom B (Source); indeks 0 = baris 1
-    for baris in range(PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR + 1):
-        if baris > len(isi) or isi[baris - 1].strip() == '':
-            break
-    else:
-        raise TabelPenuh()
-    ws.update(range_name=f'B{baris}:D{baris}',
-              values=[[sumber, _tanggal(), nominal]], raw=False)
+    baris = _tulis_ke_tabel(ws, 'B', 'D', PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR,
+                            'Pemasukan', sumber, nominal, jejak)
     return ws.title, baris
+
+
+def simpan_pemasukan_bank(bank, nominal, jejak=None):
+    """Tulis satu baris ke tabel Pemasukan Bank (T-V), misalnya bank='BNI'.
+
+    Mengembalikan (nama tab, nomor baris).
+    """
+    ws = _tab_bulan()
+    baris = _tulis_ke_tabel(ws, 'T', 'V', PEMASUKAN_BANK_BARIS_AWAL, PEMASUKAN_BANK_BARIS_AKHIR,
+                            'Pemasukan Bank', bank, nominal, jejak)
+    return ws.title, baris
+
+
+def ambil_saldo():
+    """Baca angka ringkasan dari tab bulan ini.
+
+    Mengembalikan (nama tab, {label: nilai}), misalnya
+    {'Pemasukan': 2054700, 'Sisa Uang': 235000, 'BNI': 808489, 'Mandiri': 21286, ...}.
+    """
+    ws = _tab_bulan()
+    blok = ws.batch_get([RENTANG_HASIL_AKHIR, RENTANG_SALDO_BANK],
+                        value_render_option='UNFORMATTED_VALUE')
+    hasil = {}
+    for isi in blok:
+        for baris in isi:
+            # hanya baris "label | angka"; baris judul ("Total | Nilai") terlewati
+            if len(baris) >= 2 and isinstance(baris[1], (int, float)):
+                hasil[str(baris[0]).strip()] = baris[1]
+    return ws.title, hasil
 
 
 def ambil_pengeluaran_hari_ini():
@@ -122,3 +197,87 @@ def ambil_pengeluaran_hari_ini():
             except (TypeError, ValueError):
                 continue      # baris kosong atau bukan tanggal
     return daftar
+
+
+# ---------------------------------------------------------------------------
+# Riwayat untuk /undo
+# ---------------------------------------------------------------------------
+
+def _baca_riwayat():
+    try:
+        with open(RIWAYAT_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _tulis_riwayat(daftar):
+    with open(RIWAYAT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(daftar[-RIWAYAT_MAKS:], f, ensure_ascii=False, indent=1)
+
+
+def simpan_riwayat(ringkasan, jejak):
+    """Simpan satu catatan (bisa terdiri dari beberapa sel) supaya bisa dibatalkan."""
+    with _kunci_riwayat:
+        daftar = _baca_riwayat()
+        daftar.append({'waktu': sekarang().isoformat(timespec='seconds'),
+                       'ringkasan': ringkasan,
+                       'tulisan': jejak})
+        _tulis_riwayat(daftar)
+
+
+def _sel_masih_sama(ws, tulisan):
+    """True kalau isi sel masih sama dengan yang ditulis bot (nama dan nominal)."""
+    sel = ws.get(tulisan['rentang'], value_render_option='UNFORMATTED_VALUE')
+    nilai = list(sel[0]) if sel else []
+    if len(nilai) < 3:
+        return False
+    try:
+        # tanda ' di depan hanya penanda "ini teks" dari simpan_pengeluaran, abaikan saat membandingkan
+        nama_sel = str(nilai[0]).strip().lstrip("'").lower()
+        nama_tulis = tulisan['nama'].strip().lstrip("'").lower()
+        return nama_sel == nama_tulis and float(nilai[2]) == float(tulisan['nominal'])
+    except (TypeError, ValueError):
+        return False
+
+
+def _sel_kosong(ws, tulisan):
+    sel = ws.get(tulisan['rentang'], value_render_option='UNFORMATTED_VALUE')
+    return not any(str(x).strip() for baris in sel for x in baris)
+
+
+def batalkan_terakhir():
+    """Kosongkan sel-sel dari catatan terakhir.
+
+    Mengembalikan (ringkasan, waktu) catatan yang dibatalkan, atau None kalau
+    riwayat kosong. Melempar RiwayatBerubah kalau isi sel sudah berbeda dari yang
+    ditulis bot (misalnya kamu sudah mengeditnya); catatan itu tetap dikeluarkan
+    dari riwayat, tapi selnya tidak disentuh.
+    """
+    with _kunci_riwayat:
+        daftar = _baca_riwayat()
+        if not daftar:
+            return None
+        entri = daftar[-1]
+
+        # Cek semuanya dulu; hapus hanya kalau semua sel aman.
+        yang_dihapus = []
+        aman = True
+        for t in entri['tulisan']:
+            ws = _tab(t['tab'])
+            if _sel_kosong(ws, t):
+                continue                  # sudah dikosongkan manual
+            if _sel_masih_sama(ws, t):
+                yang_dihapus.append((ws, t['rentang']))
+            else:
+                aman = False
+                break
+
+        if aman:
+            for ws, rentang in yang_dihapus:
+                ws.batch_clear([rentang])     # hanya isi, format sel tetap
+
+        _tulis_riwayat(daftar[:-1])           # keluarkan dari riwayat
+        if not aman:
+            raise RiwayatBerubah(entri['ringkasan'])
+        return entri['ringkasan'], entri['waktu']

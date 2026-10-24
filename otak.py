@@ -2,9 +2,11 @@ import traceback
 from datetime import datetime, timedelta
 
 from kalender import event_hari_ini, tambah_event
-from penyimpanan import (WIB, TabelPenuh, TabTidakAda,
-                         ambil_pengeluaran_hari_ini, sekarang,
-                         simpan_pemasukan, simpan_pengeluaran)
+from penyimpanan import (WIB, RiwayatBerubah, TabelPenuh, TabTidakAda,
+                         ambil_pengeluaran_hari_ini, ambil_saldo,
+                         batalkan_terakhir, sekarang, simpan_pemasukan,
+                         simpan_pemasukan_bank, simpan_pengeluaran,
+                         simpan_riwayat)
 
 # Kata kategori yang boleh diketik -> nama tabel di spreadsheet
 KATEGORI_ALIAS = {
@@ -15,9 +17,18 @@ KATEGORI_ALIAS = {
     'hiburan': 'Hiburan',
 }
 
-# Nama sumber yang ditulis di tabel Pemasukan untuk pembayaran QRIS.
+# Bank yang boleh diketik di /topup -> nama yang ditulis di tabel Pemasukan Bank
+BANK_ALIAS = {
+    'bni': 'BNI',
+    'mandiri': 'Mandiri',
+}
+
+# Nama sumber yang ditulis di tabel Pemasukan.
 # Rumus saldo BNI (sel L11) mencari kata "BNI", jadi kata itu harus tetap ada.
 SUMBER_QRIS = 'QRIS BNI'
+SUMBER_TARIK = 'Tarik Uang BNI'
+
+NOMINAL_TAK_TERBACA = 'Nominal tidak terbaca. Contoh: 25000, 25.000, atau 25rb'
 
 def rupiah(angka):
     return 'Rp' + f'{angka:,}'.replace(',', '.')
@@ -44,7 +55,7 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris):
     try:
         nominal = baca_nominal(bagian[0])
     except ValueError:
-        return 'Nominal tidak terbaca. Contoh: 25000, 25.000, atau 25rb'
+        return NOMINAL_TAK_TERBACA
 
     sisa = bagian[1:]
     kategori = 'Jajan'                      # kalau kategori tidak ditulis
@@ -57,11 +68,18 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris):
 
     # Pemasukan ditulis lebih dulu: kalau tab bulan belum ada atau tabel
     # Pemasukan penuh, errornya muncul sebelum ada yang tertulis setengah-setengah.
+    # "jejak" mencatat sel yang ditulis supaya bisa dibatalkan dengan /undo.
+    jejak = []
     baris_qris = None
-    if lewat_qris:
-        _, baris_qris = simpan_pemasukan(SUMBER_QRIS, nominal)
+    ringkasan = ('QRIS ' if lewat_qris else '') + kategori + ' ' + nama + ' ' + rupiah(nominal)
+    try:
+        if lewat_qris:
+            _, baris_qris = simpan_pemasukan(SUMBER_QRIS, nominal, jejak=jejak)
+        tab, baris = simpan_pengeluaran(kategori, nama, nominal, jejak=jejak)
+    finally:
+        if jejak:                           # tetap tercatat walau penulisan kedua gagal
+            simpan_riwayat(ringkasan, jejak)
 
-    tab, baris = simpan_pengeluaran(kategori, nama, nominal)
     pesan = ('✅ ' + kategori + ': ' + nama + ' ' + rupiah(nominal) +
              ' (tab ' + tab + ', baris ' + str(baris) + ')')
     if lewat_qris:
@@ -76,6 +94,73 @@ def perintah_out(argumen):
 
 def perintah_qris(argumen):
     return catat_pengeluaran(argumen, '/qris', lewat_qris=True)
+
+
+def perintah_tarik(argumen):
+    """/tarik 250rb -> baris 'Tarik Uang BNI' di tabel Pemasukan."""
+    bagian = argumen.split()
+    if len(bagian) != 1:
+        return 'Format: /tarik <nominal>\nContoh: /tarik 250rb'
+    try:
+        nominal = baca_nominal(bagian[0])
+    except ValueError:
+        return NOMINAL_TAK_TERBACA
+    if nominal <= 0:
+        return 'Nominal harus lebih dari 0.'
+    jejak = []
+    tab, baris = simpan_pemasukan(SUMBER_TARIK, nominal, jejak=jejak)
+    simpan_riwayat('Tarik tunai ' + rupiah(nominal), jejak)
+    return ('🏧 ' + SUMBER_TARIK + ' ' + rupiah(nominal) +
+            ' dicatat di Pemasukan (tab ' + tab + ', baris ' + str(baris) + ')')
+
+
+def perintah_topup(argumen):
+    """/topup bni 1jt -> baris di tabel Pemasukan Bank."""
+    bagian = argumen.split()
+    if len(bagian) != 2 or bagian[0].lower() not in BANK_ALIAS:
+        return ('Format: /topup <bni|mandiri> <nominal>\n'
+                'Contoh: /topup bni 1jt')
+    bank = BANK_ALIAS[bagian[0].lower()]
+    try:
+        nominal = baca_nominal(bagian[1])
+    except ValueError:
+        return NOMINAL_TAK_TERBACA
+    if nominal <= 0:
+        return 'Nominal harus lebih dari 0.'
+    jejak = []
+    tab, baris = simpan_pemasukan_bank(bank, nominal, jejak=jejak)
+    simpan_riwayat('Top up ' + bank + ' ' + rupiah(nominal), jejak)
+    return ('🏦 Top up ' + bank + ' ' + rupiah(nominal) +
+            ' dicatat di Pemasukan Bank (tab ' + tab + ', baris ' + str(baris) + ')')
+
+
+def perintah_saldo(argumen):
+    """/saldo -> sisa uang dan saldo bank, dibaca dari hasil rumus di spreadsheet."""
+    tab, angka = ambil_saldo()
+    baris = []
+    for label in ('Sisa Uang', 'BNI', 'Mandiri', 'Pengeluaran'):
+        if label in angka:
+            teks = label if label != 'Pengeluaran' else 'Pengeluaran bulan ini'
+            baris.append(teks + ': ' + rupiah(int(round(angka[label]))))
+    if not baris:
+        return ('Angka saldo tidak ditemukan di tab ' + tab + '. '
+                'Cek posisi tabel Hasil Akhir dan Sisa Saldo Bank '
+                '(RENTANG_HASIL_AKHIR dan RENTANG_SALDO_BANK di penyimpanan.py).')
+    return '💰 Saldo (tab ' + tab + ')\n' + '\n'.join(baris)
+
+
+def perintah_undo(argumen):
+    """/undo -> batalkan catatan terakhir (bisa diulang untuk catatan sebelumnya)."""
+    try:
+        hasil = batalkan_terakhir()
+    except RiwayatBerubah as e:
+        return ('Catatan terakhir (' + str(e) + ') sudah berbeda dari yang kutulis, '
+                'jadi tidak kuhapus. Cek dan hapus manual di spreadsheet.')
+    if hasil is None:
+        return 'Tidak ada catatan yang bisa dibatalkan.'
+    ringkasan, waktu = hasil
+    kapan = datetime.fromisoformat(waktu).strftime('%d/%m %H:%M')
+    return '↩️ Dibatalkan: ' + ringkasan + ' (dicatat ' + kapan + ')'
 
 
 def baca_tanggal(kata):
@@ -114,14 +199,21 @@ def perintah_bantuan(argumen):
     return ('Perintah:\n'
             '/out 13rb jajan lotek  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
             '/qris 13rb jajan lotek  (sama seperti /out, tapi dibayar QRIS BNI)\n'
+            '/tarik 250rb  (tarik tunai dari BNI)\n'
+            '/topup bni 1jt  (uang masuk ke rekening)\n'
+            '/saldo  (sisa uang, saldo BNI dan Mandiri)\n'
+            '/undo  (batalkan catatan terakhir)\n'
             '/todo besok 15:00 kumpul DML\n'
-            '/harian 8500 4j20m  (langkah, screentime)\n'
-            '/laporan')
+            '/harian 8500 4j20m  (langkah, screentime)')
 
 
 PERINTAH = {
     '/out': perintah_out,
     '/qris': perintah_qris,
+    '/tarik': perintah_tarik,
+    '/topup': perintah_topup,
+    '/saldo': perintah_saldo,
+    '/undo': perintah_undo,
     '/todo': perintah_todo,
     '/bantuan': perintah_bantuan,
 }
@@ -134,9 +226,10 @@ def proses_pesan(teks):
         return 'Perintah tidak dikenal. Coba: /bantuan'
     try:
         return fungsi(argumen)
-    except TabelPenuh:
-        return ('Tabel Pemasukan bulan ini sudah penuh (baris 10-31), jadi belum ada '
-                'yang dicatat. Sisipkan baris kosong di dalam tabel Pemasukan '
+    except TabelPenuh as e:
+        tabel = str(e) or 'Pemasukan'
+        return ('Tabel ' + tabel + ' bulan ini sudah penuh (baris 10-31), jadi belum ada '
+                'yang dicatat. Sisipkan baris kosong di dalam tabelnya '
                 '(di antara baris 10 dan 31 supaya rumusnya ikut melebar), lalu kirim ulang.')
     except TabTidakAda as e:
         nama = str(e)
