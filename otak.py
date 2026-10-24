@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta
 
 from kalender import event_hari_ini, tambah_event
-from penyimpanan import (WIB, TabelPenuh, TabTidakAda, ambil_harian_hari_ini,
-                         ambil_pengeluaran_hari_ini, sekarang, simpan_harian,
+from penyimpanan import (WIB, TabelPenuh, TabTidakAda,
+                         ambil_pengeluaran_hari_ini, sekarang,
                          simpan_pemasukan, simpan_pengeluaran)
 
 # Kata kategori yang boleh diketik -> nama tabel di spreadsheet
