@@ -116,7 +116,7 @@ def simpan_pemasukan(sumber, nominal):
  
     # GANTI baris ini dengan cara simpan_pengeluaran mengambil tab bulan ini
     # (fungsi/baris yang sama yang melempar TabTidakAda kalau tab belum ada).
-    ws = ambil_tab_bulan_ini()
+    ws = simpan_pengeluaran()
  
     kolom_b = ws.col_values(2)   # isi kolom B (Source) dari baris 1; sel kosong = ''
     for baris in range(PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR + 1):
