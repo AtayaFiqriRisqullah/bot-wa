@@ -197,14 +197,13 @@ def perintah_todo(argumen):
 
 def perintah_bantuan(argumen):
     return ('Perintah:\n'
-            '/out 13rb jajan lotek  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
-            '/qris 13rb jajan lotek  (sama seperti /out, tapi dibayar QRIS BNI)\n'
-            '/tarik 250rb  (tarik tunai dari BNI)\n'
-            '/topup bni 1jt  (uang masuk ke rekening)\n'
+            '/out <nominal> <kategori> <nama>  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
+            '/qris <nominal> <kategori> <nama>\n'
+            '/tarik <nominal>  (tarik tunai dari BNI)\n'
+            '/topup <rekening> <nominal>\n'
             '/saldo  (sisa uang, saldo BNI dan Mandiri)\n'
             '/undo  (batalkan catatan terakhir)\n'
-            '/todo besok 15:00 kumpul DML\n'
-            '/harian 8500 4j20m  (langkah, screentime)')
+            '/todo <hariini|besok|lusa|14/10> <jam> <judul>')
 
 
 PERINTAH = {
