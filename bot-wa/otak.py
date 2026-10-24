@@ -1,9 +1,9 @@
 from datetime import datetime, timedelta
 
 from kalender import event_hari_ini, tambah_event
-from penyimpanan import (WIB, TabTidakAda, ambil_harian_hari_ini,
+from penyimpanan import (WIB, TabelPenuh, TabTidakAda, ambil_harian_hari_ini,
                          ambil_pengeluaran_hari_ini, sekarang, simpan_harian,
-                         simpan_pengeluaran)
+                         simpan_pemasukan, simpan_pengeluaran)
 
 # Kata kategori yang boleh diketik -> nama tabel di spreadsheet
 KATEGORI_ALIAS = {
@@ -14,10 +14,12 @@ KATEGORI_ALIAS = {
     'hiburan': 'Hiburan',
 }
 
+# Nama sumber yang ditulis di tabel Pemasukan untuk pembayaran QRIS.
+# Rumus saldo BNI (sel L11) mencari kata "BNI", jadi kata itu harus tetap ada.
+SUMBER_QRIS = 'QRIS BNI'
 
 def rupiah(angka):
     return 'Rp' + f'{angka:,}'.replace(',', '.')
-
 
 def baca_nominal(teks):
     """'25000', '25.000', '25rb', '25k' -> 25000"""
@@ -29,13 +31,15 @@ def baca_nominal(teks):
         pengali, t = 1_000, t.rstrip('rbk')
     return int(t) * pengali
 
-
-def perintah_out(argumen):
+def catat_pengeluaran(argumen, nama_perintah, lewat_qris):
+    """Dipakai bersama oleh /out dan /qris.
+    Kalau lewat_qris True, selain mencatat pengeluaran, bot juga menambah satu
+    baris SUMBER_QRIS di tabel Pemasukan dengan nominal yang sama."""
     bagian = argumen.split()
     if len(bagian) < 2:
-        return ('Format: /out <nominal> [kategori] <nama barang>\n'
+        return ('Format: ' + nama_perintah + ' <nominal> [kategori] <nama barang>\n'
                 'Kategori: jajan (otomatis), alat, mingguan, bulanan, hiburan\n'
-                'Contoh: /out 13rb jajan lotek')
+                'Contoh: ' + nama_perintah + ' 13rb jajan lotek')
     try:
         nominal = baca_nominal(bagian[0])
     except ValueError:
@@ -47,12 +51,30 @@ def perintah_out(argumen):
         kategori = KATEGORI_ALIAS[sisa[0].lower()]
         sisa = sisa[1:]
         if not sisa:
-            return 'Tulis nama barangnya. Contoh: /out 65rb alat teko listrik'
+            return 'Tulis nama barangnya. Contoh: ' + nama_perintah + ' 65rb alat teko listrik'
     nama = ' '.join(sisa)
 
+    # Pemasukan ditulis lebih dulu: kalau tab bulan belum ada atau tabel
+    # Pemasukan penuh, errornya muncul sebelum ada yang tertulis setengah-setengah.
+    baris_qris = None
+    if lewat_qris:
+        _, baris_qris = simpan_pemasukan(SUMBER_QRIS, nominal)
+
     tab, baris = simpan_pengeluaran(kategori, nama, nominal)
-    return ('✅ ' + kategori + ': ' + nama + ' ' + rupiah(nominal) +
-            ' (tab ' + tab + ', baris ' + str(baris) + ')')
+    pesan = ('✅ ' + kategori + ': ' + nama + ' ' + rupiah(nominal) +
+             ' (tab ' + tab + ', baris ' + str(baris) + ')')
+    if lewat_qris:
+        pesan += ('\n💳 ' + SUMBER_QRIS + ' ' + rupiah(nominal) +
+                  ' dicatat di Pemasukan (baris ' + str(baris_qris) + ')')
+    return pesan
+
+
+def perintah_out(argumen):
+    return catat_pengeluaran(argumen, '/out', lewat_qris=False)
+
+
+def perintah_qris(argumen):
+    return catat_pengeluaran(argumen, '/qris', lewat_qris=True)
 
 
 def baca_tanggal(kata):
@@ -87,67 +109,10 @@ def perintah_todo(argumen):
     return '📅 Ditambahkan: ' + bagian[2] + ' (' + waktu + ')'
 
 
-def baca_durasi(teks):
-    """'4j20m' -> 260, '90m' -> 90, '2j' -> 120 (hasil dalam menit)"""
-    t = teks.lower()
-    jam = menit = 0
-    if 'j' in t:
-        bagian_jam, t = t.split('j', 1)
-        jam = int(bagian_jam)
-    if t.endswith('m'):
-        t = t[:-1]
-    if t:
-        menit = int(t)
-    return jam * 60 + menit
-
-
-def perintah_harian(argumen):
-    bagian = argumen.split()
-    if len(bagian) != 2:
-        return 'Format: /harian <langkah> <screentime>\nContoh: /harian 8500 4j20m'
-    try:
-        langkah = int(bagian[0].replace('.', ''))
-        menit = baca_durasi(bagian[1])
-    except ValueError:
-        return 'Angka tidak terbaca. Contoh: /harian 8500 4j20m'
-    simpan_harian(langkah, menit)
-    return '✅ Tercatat: ' + str(langkah) + ' langkah, screentime ' + str(menit // 60) + 'j ' + str(menit % 60) + 'm'
-
-
-def perintah_laporan(argumen):
-    total = 0
-    per_kategori = {}
-    for kategori, nama, nilai in ambil_pengeluaran_hari_ini():
-        total += nilai
-        per_kategori[kategori] = per_kategori.get(kategori, 0) + nilai
-
-    baris = ['📊 Laporan ' + sekarang().strftime('%d/%m/%Y'), '']
-    baris.append('💸 Pengeluaran: ' + rupiah(total))
-    for kategori, nilai in per_kategori.items():
-        baris.append('   • ' + kategori + ': ' + rupiah(nilai))
-
-    harian = ambil_harian_hari_ini()
-    if harian:
-        menit = int(float(harian[2]))
-        baris.append('👟 Langkah: ' + str(harian[1]))
-        baris.append('📱 Screentime: ' + str(menit // 60) + 'j ' + str(menit % 60) + 'm')
-    else:
-        baris.append('👟 Langkah dan screentime belum diisi (pakai /harian)')
-
-    baris.append('')
-    acara = event_hari_ini()
-    if acara:
-        baris.append('📅 Agenda hari ini:')
-        for jam, judul in acara:
-            baris.append('   • ' + jam + ' ' + judul)
-    else:
-        baris.append('📅 Tidak ada agenda hari ini')
-    return '\n'.join(baris)
-
-
 def perintah_bantuan(argumen):
     return ('Perintah:\n'
             '/out 13rb jajan lotek  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
+            '/qris 13rb jajan lotek  (sama seperti /out, tapi dibayar QRIS BNI)\n'
             '/todo besok 15:00 kumpul DML\n'
             '/harian 8500 4j20m  (langkah, screentime)\n'
             '/laporan')
@@ -155,9 +120,8 @@ def perintah_bantuan(argumen):
 
 PERINTAH = {
     '/out': perintah_out,
+    '/qris': perintah_qris,
     '/todo': perintah_todo,
-    '/harian': perintah_harian,
-    '/laporan': perintah_laporan,
     '/bantuan': perintah_bantuan,
 }
 
@@ -169,6 +133,10 @@ def proses_pesan(teks):
         return 'Perintah tidak dikenal. Coba: /bantuan'
     try:
         return fungsi(argumen)
+    except TabelPenuh:
+        return ('Tabel Pemasukan bulan ini sudah penuh (baris 10-31), jadi belum ada '
+                'yang dicatat. Sisipkan baris kosong di dalam tabel Pemasukan '
+                '(di antara baris 10 dan 31 supaya rumusnya ikut melebar), lalu kirim ulang.')
     except TabTidakAda as e:
         nama = str(e)
         if nama == 'harian':

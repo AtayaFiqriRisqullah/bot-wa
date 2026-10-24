@@ -98,12 +98,35 @@ def ambil_pengeluaran_hari_ini():
                 continue      # baris kosong atau bukan tanggal
     return daftar
 
-
-def simpan_harian(langkah, menit_layar):
-    _tab('harian').append_row([_tanggal(), langkah, menit_layar])
-
-
-def ambil_harian_hari_ini():
-    semua = _tab('harian').get_all_values()[1:]
-    cocok = [b for b in semua if b and b[0] == _tanggal()]
-    return cocok[-1] if cocok else None   # isian terakhir hari ini
+# Tempel potongan ini ke penyimpanan.py (di bawah simpan_pengeluaran).
+# Diasumsikan penyimpanan.py memakai gspread. Kalau beda, kirim isi
+# penyimpanan.py supaya bisa disesuaikan persis.
+ 
+PEMASUKAN_BARIS_AWAL = 10    # baris 9 = "Sisa Bulanan", jangan ditimpa
+PEMASUKAN_BARIS_AKHIR = 31   # batas rumus L11 (B10:B31)
+ 
+ 
+class TabelPenuh(Exception):
+    """Tabel Pemasukan sudah terisi sampai baris terakhir yang dihitung rumus."""
+ 
+ 
+def simpan_pemasukan(sumber, nominal):
+    """Isi baris kosong pertama di tabel Pemasukan (kolom B-D) pada tab bulan ini.
+    Mengembalikan (nama_tab, nomor_baris)."""
+ 
+    # GANTI baris ini dengan cara simpan_pengeluaran mengambil tab bulan ini
+    # (fungsi/baris yang sama yang melempar TabTidakAda kalau tab belum ada).
+    ws = ambil_tab_bulan_ini()
+ 
+    kolom_b = ws.col_values(2)   # isi kolom B (Source) dari baris 1; sel kosong = ''
+    for baris in range(PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR + 1):
+        if baris > len(kolom_b) or not kolom_b[baris - 1].strip():
+            break
+    else:
+        raise TabelPenuh()
+ 
+    tanggal = sekarang().date().isoformat()   # contoh: 2026-10-24
+    ws.update(range_name='B' + str(baris) + ':D' + str(baris),
+              values=[[sumber, tanggal, nominal]],
+              value_input_option='RAW')       # RAW: tanggal tetap teks, nominal tetap angka
+    return ws.title, baris
