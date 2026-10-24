@@ -79,8 +79,9 @@ def sekarang():
     return datetime.now(WIB)
 
 
-def _tanggal():
-    return sekarang().strftime('%Y-%m-%d')
+def _tanggal(tanggal=None):
+    """Teks 'YYYY-MM-DD' untuk `tanggal` (date), atau untuk hari ini kalau kosong."""
+    return (tanggal or sekarang().date()).strftime('%Y-%m-%d')
 
 
 def _tab(nama):
@@ -93,6 +94,14 @@ def _tab(nama):
 def _tab_bulan():
     """Tab untuk bulan berjalan, misalnya 'Oktober'."""
     return _tab(BULAN[sekarang().month - 1])
+
+
+def _tab_untuk(tanggal=None):
+    """Tab bulan dari `tanggal` (date); kosong berarti bulan berjalan.
+    Nama tab hanya berisi bulan tanpa tahun, jadi tahun tidak ikut menentukan tab."""
+    if tanggal is None:
+        return _tab_bulan()
+    return _tab(BULAN[tanggal.month - 1])
 
 
 def _baris_kosong(ws, kolom):
@@ -113,12 +122,15 @@ def _catat_jejak(jejak, ws, rentang, nama, nominal):
                       'nama': str(nama), 'nominal': nominal})
 
 
-def simpan_pengeluaran(kategori, nama, nominal, jejak=None):
-    """Tulis satu pengeluaran ke tabel kategori di tab bulan ini.
+def simpan_pengeluaran(kategori, nama, nominal, jejak=None, tanggal=None):
+    """Tulis satu pengeluaran ke tabel kategori.
+
+    `tanggal` (date) kosong berarti hari ini, di tab bulan ini. Kalau diisi, tanggal
+    itu yang ditulis dan barisnya masuk ke tab bulan dari tanggal tersebut.
 
     Mengembalikan (nama tab, nomor baris) supaya bisa dilaporkan ke pengguna.
     """
-    ws = _tab_bulan()
+    ws = _tab_untuk(tanggal)
     kolom_awal, kolom_akhir = KATEGORI[kategori]
     baris = _baris_kosong(ws, kolom_awal)
     nama_tulis = nama
@@ -128,14 +140,15 @@ def simpan_pengeluaran(kategori, nama, nominal, jejak=None):
     # raw=False: tanggal '2026-10-13' dibaca Sheets sebagai tanggal asli,
     # dan formatnya mengikuti format sel (misalnya 13/10/2026).
     ws.update(range_name=rentang,
-              values=[[nama_tulis, _tanggal(), nominal]], raw=False)
+              values=[[nama_tulis, _tanggal(tanggal), nominal]], raw=False)
     _catat_jejak(jejak, ws, rentang, nama, nominal)
     return ws.title, baris
 
 
 def _tulis_ke_tabel(ws, kolom_awal, kolom_akhir, baris_awal, baris_akhir,
-                    nama_tabel, nama, nominal, jejak):
-    """Isi baris kosong pertama di tabel (nama / tanggal hari ini / nominal)."""
+                    nama_tabel, nama, nominal, jejak, tanggal=None):
+    """Isi baris kosong pertama di tabel (nama / tanggal / nominal).
+    `tanggal` (date) kosong berarti hari ini."""
     nomor_kolom = a1_to_rowcol(kolom_awal + '1')[1]
     isi = ws.col_values(nomor_kolom)      # indeks 0 = baris 1; sel kosong = ''
     for baris in range(baris_awal, baris_akhir + 1):
@@ -145,19 +158,20 @@ def _tulis_ke_tabel(ws, kolom_awal, kolom_akhir, baris_awal, baris_akhir,
         raise TabelPenuh(nama_tabel)
     rentang = f'{kolom_awal}{baris}:{kolom_akhir}{baris}'
     ws.update(range_name=rentang,
-              values=[[nama, _tanggal(), nominal]], raw=False)
+              values=[[nama, _tanggal(tanggal), nominal]], raw=False)
     _catat_jejak(jejak, ws, rentang, nama, nominal)
     return baris
 
 
-def simpan_pemasukan(sumber, nominal, jejak=None):
-    """Tulis satu baris ke tabel Pemasukan (B-D) pada tab bulan ini.
+def simpan_pemasukan(sumber, nominal, jejak=None, tanggal=None):
+    """Tulis satu baris ke tabel Pemasukan (B-D). `tanggal` (date) kosong berarti
+    hari ini di tab bulan ini; kalau diisi, tab dan tanggalnya mengikuti tanggal itu.
 
     Mengembalikan (nama tab, nomor baris).
     """
-    ws = _tab_bulan()                     # melempar TabTidakAda kalau tab belum ada
+    ws = _tab_untuk(tanggal)                     # melempar TabTidakAda kalau tab belum ada
     baris = _tulis_ke_tabel(ws, 'B', 'D', PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR,
-                            'Pemasukan', sumber, nominal, jejak)
+                            'Pemasukan', sumber, nominal, jejak, tanggal=tanggal)
     return ws.title, baris
 
 
@@ -318,6 +332,14 @@ def simpan_riwayat(ringkasan, jejak):
                        'ringkasan': ringkasan,
                        'tulisan': jejak})
         _tulis_riwayat(daftar)
+
+
+def ambil_riwayat(jumlah):
+    """`jumlah` catatan terakhir, yang terbaru di depan: [{'waktu', 'ringkasan', 'tulisan'}].
+    Urutannya sama dengan urutan /undo membatalkan."""
+    with _kunci_riwayat:
+        daftar = _baca_riwayat()
+    return daftar[::-1][:jumlah]
 
 
 def _sel_masih_sama(ws, tulisan):

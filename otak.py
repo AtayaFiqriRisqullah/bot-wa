@@ -1,9 +1,10 @@
+import re
 import traceback
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from kalender import event_hari_ini, tambah_event
-from penyimpanan import (WIB, RiwayatBerubah, TabelPenuh, TabTidakAda,
-                         ambil_pengeluaran_hari_ini, ambil_saldo,
+from penyimpanan import (RIWAYAT_MAKS, WIB, RiwayatBerubah, TabelPenuh, TabTidakAda,
+                         ambil_pengeluaran_hari_ini, ambil_riwayat, ambil_saldo,
                          ambil_total_kategori, baca_pengaturan,
                          batalkan_terakhir, nama_bulan, pengingat_sudah_dicek,
                          sekarang, simpan_pemasukan, simpan_pemasukan_bank,
@@ -38,7 +39,14 @@ PINTASAN_AWAL = {
 }
 
 # Kata yang tidak boleh jadi nama pintasan (dipakai di awal pesan tanpa perintah).
-NAMA_TERLARANG = {'hapus', 'qris', 'out'}
+NAMA_TERLARANG = {'hapus', 'qris', 'out', 'kemarin'}
+
+# Tanggal untuk mencatat pengeluaran yang terlewat: "/out kemarin 13rb lotek" atau
+# "/out 22/10 13rb lotek" (tanggal/bulan, tahun ini). Tidak boleh di masa depan.
+POLA_TANGGAL = re.compile(r'^(\d{1,2})/(\d{1,2})$')
+
+# Jumlah catatan yang ditampilkan /riwayat kalau tidak diberi angka.
+RIWAYAT_TAMPIL = 5
 
 # Pengingat "belum catat pengeluaran": dikirim sekali sehari, mulai jam ini (WIB).
 JAM_PENGINGAT = 20
@@ -78,6 +86,35 @@ def baca_nominal(teks):
     elif t.endswith('rb') or t.endswith('k'):
         pengali, t = 1_000, t.rstrip('rbk')
     return int(t) * pengali
+
+
+def kata_tanggal(kata):
+    """True kalau `kata` berbentuk penanda tanggal: 'kemarin' atau '22/10'."""
+    kata = kata.lower()
+    return kata == 'kemarin' or bool(POLA_TANGGAL.match(kata))
+
+
+def baca_tanggal_lalu(kata):
+    """'kemarin' atau '22/10' -> date. Melempar ValueError berisi pesan untuk
+    pengguna kalau tanggalnya tidak ada atau belum terjadi.
+    (Beda dengan baca_tanggal di bawah, yang untuk /todo dan melihat ke depan.)"""
+    hari_ini = sekarang().date()
+    kata = kata.lower()
+    if kata == 'kemarin':
+        return hari_ini - timedelta(days=1)
+    cocok = POLA_TANGGAL.match(kata)
+    tgl = None
+    if cocok:
+        try:
+            tgl = date(hari_ini.year, int(cocok.group(2)), int(cocok.group(1)))
+        except ValueError:                  # misalnya 30/2
+            pass
+    if tgl is None:
+        raise ValueError('Tanggal ' + kata + ' tidak valid. Contoh: /out 22/10 13rb lotek')
+    if tgl > hari_ini:
+        raise ValueError('Tanggal ' + kata + ' belum terjadi, jadi belum dicatat. '
+                         'Pengeluaran hanya bisa dicatat untuk hari ini atau hari yang sudah lewat.')
+    return tgl
 
 
 def daftar_pintasan():
@@ -120,7 +157,9 @@ def baca_pengeluaran_biasa(bagian, nama_perintah, daftar):
     if len(bagian) < 2:
         pesan = ('Format: ' + nama_perintah + ' <nominal> [kategori] <nama barang>\n'
                  'Kategori: jajan (otomatis), alat, mingguan, bulanan, hiburan\n'
-                 'Contoh: ' + nama_perintah + ' 13rb jajan lotek')
+                 'Contoh: ' + nama_perintah + ' 13rb jajan lotek\n'
+                 'Hari lain: ' + nama_perintah + ' kemarin 13rb lotek, atau ' +
+                 nama_perintah + ' 22/10 13rb lotek')
         if daftar:
             pesan += ('\nPintasan: ' + ', '.join(daftar) +
                       ' (contoh: ' + nama_perintah + ' ' + next(iter(daftar)) + ')')
@@ -145,8 +184,23 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris, nominal_minimal=0):
     Kalau lewat_qris True, selain mencatat pengeluaran, bot juga menambah satu
     baris SUMBER_QRIS di tabel Pemasukan dengan nominal yang sama.
 
-    Mengembalikan (pesan, kategori). kategori None artinya tidak ada yang dicatat."""
+    Pengeluaran bisa untuk hari lain: tanggalnya ('kemarin' atau '22/10') ditulis paling
+    depan, sebelum nominal atau nama pintasan.
+
+    Mengembalikan (pesan, kategori). kategori None artinya baris sisa uang dan peringatan
+    batas tidak perlu ditampilkan: tidak ada yang dicatat, atau yang dicatat masuk ke
+    bulan lain (sisa uang dan batas yang ditampilkan selalu milik bulan berjalan)."""
     bagian = argumen.split()
+    hari_ini = sekarang().date()
+    tanggal = None                          # None = hari ini
+    if bagian and kata_tanggal(bagian[0]):
+        try:
+            tanggal = baca_tanggal_lalu(bagian[0])
+        except ValueError as e:
+            return str(e), None
+        bagian = bagian[1:]
+        if tanggal == hari_ini:
+            tanggal = None
     daftar = daftar_pintasan()
     dari_pintasan = bool(bagian) and bagian[0].lower() in daftar
     if dari_pintasan:
@@ -169,19 +223,24 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris, nominal_minimal=0):
     jejak = []
     baris_qris = None
     ringkasan = ('QRIS ' if lewat_qris else '') + kategori + ' ' + nama + ' ' + rupiah(nominal)
+    if tanggal:
+        ringkasan += ' untuk ' + tanggal.strftime('%d/%m')
     try:
         if lewat_qris:
-            _, baris_qris = simpan_pemasukan(SUMBER_QRIS, nominal, jejak=jejak)
-        tab, baris = simpan_pengeluaran(kategori, nama, nominal, jejak=jejak)
+            _, baris_qris = simpan_pemasukan(SUMBER_QRIS, nominal, jejak=jejak, tanggal=tanggal)
+        tab, baris = simpan_pengeluaran(kategori, nama, nominal, jejak=jejak, tanggal=tanggal)
     finally:
         if jejak:                           # tetap tercatat walau penulisan kedua gagal
             simpan_riwayat(ringkasan, jejak)
 
     pesan = ('✅ ' + kategori + ': ' + nama + ' ' + rupiah(nominal) +
+             (' untuk ' + tanggal.strftime('%d/%m/%Y') if tanggal else '') +
              ' (tab ' + tab + ', baris ' + str(baris) + ')')
     if lewat_qris:
         pesan += ('\n💳 ' + SUMBER_QRIS + ' ' + rupiah(nominal) +
                   ' dicatat di Pemasukan (baris ' + str(baris_qris) + ')')
+    if tanggal and (tanggal.year, tanggal.month) != (hari_ini.year, hari_ini.month):
+        return pesan, None                  # bulan lain: sisa uang dan batas bulan ini tidak berubah
     return pesan, kategori
 
 
@@ -464,6 +523,40 @@ def perintah_undo(argumen):
     return '↩️ Dibatalkan: ' + ringkasan + ' (dicatat ' + kapan + ')'
 
 
+def perintah_hariini(argumen):
+    """/hariini -> semua pengeluaran bertanggal hari ini beserta totalnya
+    (untuk mengecek "tadi sudah kecatat belum?")."""
+    daftar = ambil_pengeluaran_hari_ini()          # TabTidakAda ditangani proses_pesan
+    tanggal = sekarang().strftime('%d/%m')
+    if not daftar:
+        return '📋 Belum ada pengeluaran yang tercatat hari ini (' + tanggal + ').'
+    baris = ['📋 Pengeluaran hari ini (' + tanggal + ')']
+    for kategori, nama, nilai in daftar:
+        baris.append('• ' + kategori + ': ' + nama + ' ' + rupiah(nilai))
+    baris.append('Total: ' + rupiah(sum(nilai for _, _, nilai in daftar)))
+    return '\n'.join(baris)
+
+
+def perintah_riwayat(argumen):
+    """/riwayat [jumlah] -> catatan terakhir, yang terbaru di atas. Urutannya sama dengan
+    urutan /undo membatalkan, jadi baris nomor 1 adalah yang akan dihapus /undo."""
+    teks = argumen.strip()
+    jumlah = RIWAYAT_TAMPIL
+    if teks:
+        if not teks.isdigit() or int(teks) < 1:
+            return ('Format: /riwayat [jumlah]\n'
+                    'Contoh: /riwayat 10 (maksimal ' + str(RIWAYAT_MAKS) + ')')
+        jumlah = min(int(teks), RIWAYAT_MAKS)
+    daftar = ambil_riwayat(jumlah)
+    if not daftar:
+        return 'Riwayat kosong, tidak ada catatan yang bisa dibatalkan.'
+    baris = ['🕘 ' + str(len(daftar)) + ' catatan terakhir (nomor 1 = yang dibatalkan /undo berikutnya)']
+    for nomor, entri in enumerate(daftar, 1):
+        kapan = datetime.fromisoformat(entri['waktu']).strftime('%d/%m %H:%M')
+        baris.append(str(nomor) + '. ' + entri['ringkasan'] + ' (dicatat ' + kapan + ')')
+    return '\n'.join(baris)
+
+
 def baca_tanggal(kata):
     hari_ini = sekarang().date()
     kata = kata.lower()
@@ -501,15 +594,14 @@ def perintah_bantuan(argumen):
     return ('Perintah:\n'
             '/out <nominal> <kategori> <nama>  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
             '/qris <nominal> <kategori> <nama>\n'
-            'Tanpa perintah juga bisa: 13rb lotek, qris 13rb lotek, atau nama pintasan. '
-            'Beberapa baris sekaligus boleh (maks ' + str(MAKS_BARIS) + ').\n'
-            '/out atau /qris <pintasan> [nominal]  (pintasan: ' + pintasan + ')\n'
             '/pintasan  (lihat, tambah, ubah, hapus pintasan)\n'
             '/batas  (batas bulanan per kategori)\n'
             '/tarik <nominal>  (tarik tunai dari BNI)\n'
             '/topup <rekening> <nominal>\n'
             '/saldo  (sisa uang, saldo BNI dan Mandiri)\n'
             '/rekap  (total per kategori bulan ini dan selisih dengan bulan lalu)\n'
+            '/hariini  (pengeluaran hari ini dan totalnya)\n'
+            '/riwayat [jumlah]  (catatan terakhir, urutan yang dibatalkan /undo)\n'
             '/undo  (batalkan catatan terakhir)\n'
             '/todo <hariini|besok|lusa|14/10> <jam> <judul>')
 
@@ -523,6 +615,8 @@ PERINTAH = {
     '/rekap': perintah_rekap,
     '/pintasan': perintah_pintasan,
     '/batas': perintah_batas,
+    '/hariini': perintah_hariini,
+    '/riwayat': perintah_riwayat,
     '/undo': perintah_undo,
     '/todo': perintah_todo,
     '/bantuan': perintah_bantuan,
@@ -549,10 +643,11 @@ def pesan_kesalahan(e):
 
 
 def baca_pesan_bebas(baris):
-    """Pesan tanpa '/': '13rb lotek', 'galon', 'qris 13rb lotek', 'out 5rb es teh'
-    -> (argumen untuk catat_pengeluaran, lewat_qris).
-    None kalau pesannya tidak mirip pengeluaran. Kata pertama harus berupa nominal
-    atau nama pintasan, jadi obrolan biasa tidak ikut tercatat."""
+    """Pesan tanpa '/': '13rb lotek', 'galon', 'qris 13rb lotek', 'out 5rb es teh',
+    'kemarin 13rb lotek' -> (argumen untuk catat_pengeluaran, lewat_qris).
+    None kalau pesannya tidak mirip pengeluaran. Kata pertama (setelah qris/out dan
+    tanggal, kalau ada) harus berupa nominal atau nama pintasan, jadi obrolan biasa
+    tidak ikut tercatat."""
     bagian = baris.split()
     if not bagian:
         return None
@@ -562,7 +657,10 @@ def baca_pesan_bebas(baris):
         bagian = bagian[1:]
         if not bagian:
             return None
-    pertama = bagian[0].lower()
+    mulai = 1 if kata_tanggal(bagian[0]) else 0     # tanggal boleh di depan: "kemarin 13rb lotek"
+    if mulai == len(bagian):
+        return None
+    pertama = bagian[mulai].lower()
     if pertama not in daftar_pintasan():
         try:
             baca_nominal(pertama)
