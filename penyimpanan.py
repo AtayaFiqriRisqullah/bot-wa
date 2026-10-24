@@ -51,10 +51,14 @@ RIWAYAT_MAKS = 20
 # pengingat "belum catat pengeluaran" dicek, supaya tidak terkirim dua kali sehari.
 STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status.json')
 
+# Pengaturan yang diubah lewat chat (daftar pintasan dan batas bulanan per kategori).
+PENGATURAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pengaturan.json')
+
 _akun = gspread.service_account_from_dict(muat_kunci())
 _buku = _akun.open_by_key(SHEET_ID)
 _kunci_riwayat = threading.Lock()
 _kunci_status = threading.Lock()
+_kunci_pengaturan = threading.Lock()
 
 
 class TabTidakAda(Exception):
@@ -240,12 +244,16 @@ def ambil_total_kategori(nama_tab):
 # Status pengingat
 # ---------------------------------------------------------------------------
 
-def _baca_status():
+def _baca_json(path):
     try:
-        with open(STATUS_FILE, encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def _baca_status():
+    return _baca_json(STATUS_FILE)
 
 
 def pengingat_sudah_dicek(tanggal):
@@ -260,6 +268,29 @@ def tandai_pengingat_dicek(tanggal):
         status['pengingat_pengeluaran'] = tanggal
         with open(STATUS_FILE, 'w', encoding='utf-8') as f:
             json.dump(status, f, ensure_ascii=False, indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Pengaturan yang diubah lewat chat
+# ---------------------------------------------------------------------------
+
+def baca_pengaturan(kunci):
+    """Nilai pengaturan `kunci` ('pintasan' atau 'batas'), atau None kalau belum
+    pernah disimpan."""
+    with _kunci_pengaturan:
+        return _baca_json(PENGATURAN_FILE).get(kunci)
+
+
+def tulis_pengaturan(kunci, nilai):
+    """Simpan `nilai` untuk `kunci`, pengaturan lain tidak disentuh. Ditulis ke file
+    sementara dulu lalu ditukar, supaya file tidak rusak kalau bot mati di tengah."""
+    with _kunci_pengaturan:
+        data = _baca_json(PENGATURAN_FILE)
+        data[kunci] = nilai
+        sementara = PENGATURAN_FILE + '.tmp'
+        with open(sementara, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(sementara, PENGATURAN_FILE)
 
 
 # ---------------------------------------------------------------------------

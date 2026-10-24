@@ -1,0 +1,24 @@
+{
+ "pintasan": {
+  "galon": [
+   "Mingguan&Bulanan",
+   "Galon",
+   7000
+  ],
+  "kopi": [
+   "Jajan",
+   "Kopi",
+   null
+  ],
+  "tempe": [
+   "Jajan",
+   "Tempe",
+   null
+  ],
+  "billiard": [
+   "Hiburan",
+   "Billiard",
+   null
+  ]
+ }
+}
