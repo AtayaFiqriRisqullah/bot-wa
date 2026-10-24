@@ -27,6 +27,7 @@ KATEGORI = {
 }
 BARIS_AWAL = 36     # baris data pertama tabel pengeluaran (baris 35 = TOTAL)
 BARIS_AKHIR = 500   # batas bawah saat membaca data
+BARIS_TOTAL = BARIS_AWAL - 1   # baris TOTAL tiap tabel pengeluaran, dibaca oleh /rekap
 
 # Tabel Pemasukan (kolom B-D: Source/Date/Nilai).
 PEMASUKAN_BARIS_AWAL = 10    # baris 9 = "Sisa Bulanan", jangan ditimpa
@@ -46,9 +47,14 @@ RENTANG_SALDO_BANK = 'K9:L12'    # Total, BNI, Mandiri
 RIWAYAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'riwayat.json')
 RIWAYAT_MAKS = 20
 
+# Status kecil yang harus selamat dari restart bot. Sekarang isinya tanggal terakhir
+# pengingat "belum catat pengeluaran" dicek, supaya tidak terkirim dua kali sehari.
+STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status.json')
+
 _akun = gspread.service_account_from_dict(muat_kunci())
 _buku = _akun.open_by_key(SHEET_ID)
 _kunci_riwayat = threading.Lock()
+_kunci_status = threading.Lock()
 
 
 class TabTidakAda(Exception):
@@ -197,6 +203,63 @@ def ambil_pengeluaran_hari_ini():
             except (TypeError, ValueError):
                 continue      # baris kosong atau bukan tanggal
     return daftar
+
+
+def nama_bulan(mundur=0):
+    """Nama tab bulan berjalan. mundur=1 berarti bulan lalu."""
+    return BULAN[(sekarang().month - 1 - mundur) % 12]
+
+
+def _angka(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def ambil_total_kategori(nama_tab):
+    """Total tiap tabel pengeluaran di tab `nama_tab`, dibaca dari baris TOTAL.
+
+    Mengembalikan {'Jajan': 420000, 'Alat': 0, ...}. Kalau sel TOTAL kosong atau
+    bukan angka, totalnya dijumlahkan dari baris datanya.
+    Melempar TabTidakAda kalau tabnya tidak ada.
+    """
+    ws = _tab(nama_tab)
+    rentang = [f'{b}{BARIS_TOTAL}:{b}{BARIS_AKHIR}' for _, b in KATEGORI.values()]
+    hasil = ws.batch_get(rentang, value_render_option='UNFORMATTED_VALUE')
+    total = {}
+    for kategori, blok in zip(KATEGORI, hasil):
+        # satu nilai per baris; elemen pertama = baris TOTAL
+        sel = [baris[0] if baris else '' for baris in blok]
+        if sel and _angka(sel[0]):
+            nilai = sel[0]
+        else:
+            nilai = sum(x for x in sel[1:] if _angka(x))
+        total[kategori] = int(round(nilai))
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Status pengingat
+# ---------------------------------------------------------------------------
+
+def _baca_status():
+    try:
+        with open(STATUS_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def pengingat_sudah_dicek(tanggal):
+    """True kalau pengingat pengeluaran untuk `tanggal` ('2026-10-24') sudah ditangani."""
+    with _kunci_status:
+        return _baca_status().get('pengingat_pengeluaran') == tanggal
+
+
+def tandai_pengingat_dicek(tanggal):
+    with _kunci_status:
+        status = _baca_status()
+        status['pengingat_pengeluaran'] = tanggal
+        with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(status, f, ensure_ascii=False, indent=1)
 
 
 # ---------------------------------------------------------------------------

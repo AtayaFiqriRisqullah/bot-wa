@@ -4,9 +4,10 @@ from datetime import datetime, timedelta
 from kalender import event_hari_ini, tambah_event
 from penyimpanan import (WIB, RiwayatBerubah, TabelPenuh, TabTidakAda,
                          ambil_pengeluaran_hari_ini, ambil_saldo,
-                         batalkan_terakhir, sekarang, simpan_pemasukan,
+                         ambil_total_kategori, batalkan_terakhir, nama_bulan,
+                         pengingat_sudah_dicek, sekarang, simpan_pemasukan,
                          simpan_pemasukan_bank, simpan_pengeluaran,
-                         simpan_riwayat)
+                         simpan_riwayat, tandai_pengingat_dicek)
 
 # Kata kategori yang boleh diketik -> nama tabel di spreadsheet
 KATEGORI_ALIAS = {
@@ -22,6 +23,20 @@ BANK_ALIAS = {
     'bni': 'BNI',
     'mandiri': 'Mandiri',
 }
+
+# Pintasan barang langganan: /qris galon, /out kopi, /qris kopi 22rb (harga ditimpa).
+# nama pintasan -> (nama tabel kategori, nama yang ditulis di sheet, harga biasa)
+# ISI harganya sesuai yang biasa kamu bayar. Selama harganya None, pintasan itu
+# hanya jalan kalau nominalnya diketik sendiri. Cek juga kategorinya sudah pas.
+PINTASAN = {
+    'galon': ('Mingguan&Bulanan', 'Galon', None),
+    'kopi': ('Jajan', 'Kopi', None),
+    'tempe': ('Jajan', 'Tempe', None),
+    'billiard': ('Hiburan', 'Billiard', None),
+}
+
+# Pengingat "belum catat pengeluaran": dikirim sekali sehari, mulai jam ini (WIB).
+JAM_PENGINGAT = 20
 
 # Nama sumber yang ditulis di tabel Pemasukan.
 # Rumus saldo BNI (sel L11) mencari kata "BNI", jadi kata itu harus tetap ada.
@@ -43,15 +58,33 @@ def baca_nominal(teks):
         pengali, t = 1_000, t.rstrip('rbk')
     return int(t) * pengali
 
-def catat_pengeluaran(argumen, nama_perintah, lewat_qris):
-    """Dipakai bersama oleh /out dan /qris.
-    Kalau lewat_qris True, selain mencatat pengeluaran, bot juga menambah satu
-    baris SUMBER_QRIS di tabel Pemasukan dengan nominal yang sama."""
-    bagian = argumen.split()
+def baca_pintasan(bagian, nama_perintah):
+    """['galon'] atau ['galon', '22rb'] -> (kategori, nama, nominal).
+    Kalau tidak bisa diproses, mengembalikan teks pesan untuk pengguna."""
+    kunci = bagian[0].lower()
+    kategori, nama, harga = PINTASAN[kunci]
+    if len(bagian) > 2:
+        return ('Format pintasan: ' + nama_perintah + ' ' + kunci +
+                ' [nominal kalau harganya beda]')
+    if len(bagian) == 2:
+        try:
+            return kategori, nama, baca_nominal(bagian[1])
+        except ValueError:
+            return NOMINAL_TAK_TERBACA
+    if harga is None:
+        return ('Harga ' + kunci + ' belum diisi di PINTASAN (otak.py). '
+                'Sementara, ketik nominalnya: ' + nama_perintah + ' ' + kunci + ' <nominal>')
+    return kategori, nama, harga
+
+
+def baca_pengeluaran_biasa(bagian, nama_perintah):
+    """['13rb', 'jajan', 'lotek'] -> (kategori, nama, nominal).
+    Kalau tidak bisa diproses, mengembalikan teks pesan untuk pengguna."""
     if len(bagian) < 2:
         return ('Format: ' + nama_perintah + ' <nominal> [kategori] <nama barang>\n'
                 'Kategori: jajan (otomatis), alat, mingguan, bulanan, hiburan\n'
-                'Contoh: ' + nama_perintah + ' 13rb jajan lotek')
+                'Contoh: ' + nama_perintah + ' 13rb jajan lotek\n'
+                'Pintasan: ' + ', '.join(PINTASAN) + ' (contoh: ' + nama_perintah + ' galon)')
     try:
         nominal = baca_nominal(bagian[0])
     except ValueError:
@@ -64,7 +97,21 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris):
         sisa = sisa[1:]
         if not sisa:
             return 'Tulis nama barangnya. Contoh: ' + nama_perintah + ' 65rb alat teko listrik'
-    nama = ' '.join(sisa)
+    return kategori, ' '.join(sisa), nominal
+
+
+def catat_pengeluaran(argumen, nama_perintah, lewat_qris):
+    """Dipakai bersama oleh /out dan /qris.
+    Kalau lewat_qris True, selain mencatat pengeluaran, bot juga menambah satu
+    baris SUMBER_QRIS di tabel Pemasukan dengan nominal yang sama."""
+    bagian = argumen.split()
+    if bagian and bagian[0].lower() in PINTASAN:
+        hasil = baca_pintasan(bagian, nama_perintah)
+    else:
+        hasil = baca_pengeluaran_biasa(bagian, nama_perintah)
+    if isinstance(hasil, str):              # pesan salah format
+        return hasil
+    kategori, nama, nominal = hasil
 
     # Pemasukan ditulis lebih dulu: kalau tab bulan belum ada atau tabel
     # Pemasukan penuh, errornya muncul sebelum ada yang tertulis setengah-setengah.
@@ -149,6 +196,46 @@ def perintah_saldo(argumen):
     return '💰 Saldo (tab ' + tab + ')\n' + '\n'.join(baris)
 
 
+def teks_selisih(angka):
+    if angka == 0:
+        return 'sama'
+    return ('+' if angka > 0 else '-') + rupiah(abs(angka))
+
+
+def perintah_rekap(argumen):
+    """/rekap -> total per kategori bulan ini (baris TOTAL di sheet) dan selisihnya
+    dengan bulan lalu."""
+    tab_ini = nama_bulan()
+    tab_lalu = nama_bulan(1)
+    ini = ambil_total_kategori(tab_ini)           # TabTidakAda ditangani proses_pesan
+    try:
+        lalu = ambil_total_kategori(tab_lalu)
+    except TabTidakAda:
+        lalu = None                               # bulan lalu belum ada, lewati perbandingan
+
+    baris = ['📊 Rekap ' + tab_ini]
+    for kategori, nilai in ini.items():
+        teks = kategori + ': ' + rupiah(nilai)
+        if lalu is not None:
+            teks += ' (' + teks_selisih(nilai - lalu[kategori]) + ')'
+        baris.append(teks)
+
+    total_ini = sum(ini.values())
+    teks = 'Total: ' + rupiah(total_ini)
+    if lalu is None:
+        baris.append(teks)
+        baris.append('')
+        baris.append('Tab ' + tab_lalu + ' belum ada, jadi belum ada perbandingan.')
+    else:
+        total_lalu = sum(lalu.values())
+        baris.append(teks + ' (' + teks_selisih(total_ini - total_lalu) + ')')
+        baris.append('')
+        baris.append('Tanda +/- = selisih dengan ' + tab_lalu + ' (total ' + rupiah(total_lalu) + '). '
+                     + tab_ini + ' baru berjalan sampai tanggal ' + str(sekarang().day) +
+                     ', ' + tab_lalu + ' sudah satu bulan penuh.')
+    return '\n'.join(baris)
+
+
 def perintah_undo(argumen):
     """/undo -> batalkan catatan terakhir (bisa diulang untuk catatan sebelumnya)."""
     try:
@@ -199,9 +286,11 @@ def perintah_bantuan(argumen):
     return ('Perintah:\n'
             '/out <nominal> <kategori> <nama>  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
             '/qris <nominal> <kategori> <nama>\n'
+            '/out atau /qris <pintasan> [nominal]  (pintasan: ' + ', '.join(PINTASAN) + ')\n'
             '/tarik <nominal>  (tarik tunai dari BNI)\n'
             '/topup <rekening> <nominal>\n'
             '/saldo  (sisa uang, saldo BNI dan Mandiri)\n'
+            '/rekap  (total per kategori bulan ini dan selisih dengan bulan lalu)\n'
             '/undo  (batalkan catatan terakhir)\n'
             '/todo <hariini|besok|lusa|14/10> <jam> <judul>')
 
@@ -212,6 +301,7 @@ PERINTAH = {
     '/tarik': perintah_tarik,
     '/topup': perintah_topup,
     '/saldo': perintah_saldo,
+    '/rekap': perintah_rekap,
     '/undo': perintah_undo,
     '/todo': perintah_todo,
     '/bantuan': perintah_bantuan,
@@ -240,3 +330,36 @@ def proses_pesan(teks):
     except Exception as e:
         traceback.print_exc()          # detail lengkap muncul di terminal Python
         return '⚠️ Error: ' + type(e).__name__ + ': ' + str(e)
+
+def pengingat_pengeluaran():
+    """Untuk penjadwal: panggil berkala (misalnya tiap menit) dan kirim hasilnya
+    kalau bukan None.
+
+    Mengembalikan teks pengingat kalau sudah lewat JAM_PENGINGAT dan hari ini belum
+    ada pengeluaran yang dicatat. Setiap hari hanya ditangani sekali (dicatat di
+    status.json): kalau sudah ada catatan, hari itu ditandai selesai tanpa pesan.
+    Kalau pembacaan sheet gagal, hari itu tidak ditandai, jadi dicoba lagi nanti.
+    """
+    waktu = sekarang()
+    if waktu.hour < JAM_PENGINGAT:
+        return None
+    hari = waktu.strftime('%Y-%m-%d')
+    if pengingat_sudah_dicek(hari):
+        return None
+
+    tambahan = ''
+    try:
+        sudah_catat = bool(ambil_pengeluaran_hari_ini())
+    except TabTidakAda as e:
+        sudah_catat = False
+        tambahan = ('\n(Tab bulan ' + str(e) + ' belum ada di spreadsheet. '
+                    'Duplikat tab Template dulu.)')
+    except Exception:
+        traceback.print_exc()
+        return None
+
+    tandai_pengingat_dicek(hari)
+    if sudah_catat:
+        return None
+    return ('🔔 Belum ada pengeluaran yang dicatat hari ini. '
+            'Catat dengan /out atau /qris, atau abaikan kalau memang tidak ada.' + tambahan)
