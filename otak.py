@@ -1,3 +1,4 @@
+import traceback
 from datetime import datetime, timedelta
 
 from kalender import event_hari_ini, tambah_event
@@ -144,3 +145,6 @@ def proses_pesan(teks):
                     '(baris 1, kolom A-C: tanggal, langkah, menit_layar).')
         return ('Tab bulan ' + nama + ' belum ada di spreadsheet. '
                 'Duplikat tab Template, lalu ganti namanya menjadi ' + nama + '.')
+    except Exception as e:
+        traceback.print_exc()          # detail lengkap muncul di terminal Python
+        return '⚠️ Error: ' + type(e).__name__ + ': ' + str(e)

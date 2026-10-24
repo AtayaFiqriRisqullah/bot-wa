@@ -22,8 +22,12 @@ KATEGORI = {
     'Mingguan&Bulanan': ('K', 'M'),
     'Hiburan': ('P', 'R'),
 }
-BARIS_AWAL = 27     # baris data pertama (baris 26 = TOTAL)
+BARIS_AWAL = 36     # baris data pertama tabel pengeluaran (baris 35 = TOTAL)
 BARIS_AKHIR = 500   # batas bawah saat membaca data
+
+# Tabel Pemasukan (kolom B-D) di tab bulanan.
+PEMASUKAN_BARIS_AWAL = 10    # baris 9 = "Sisa Bulanan", jangan ditimpa
+PEMASUKAN_BARIS_AKHIR = 31   # batas rumus saldo BNI (B10:B31)
 
 _akun = gspread.service_account_from_dict(muat_kunci())
 _buku = _akun.open_by_key(SHEET_ID)
@@ -31,6 +35,10 @@ _buku = _akun.open_by_key(SHEET_ID)
 
 class TabTidakAda(Exception):
     """Dilempar kalau ada tab yang tidak ditemukan di spreadsheet."""
+
+
+class TabelPenuh(Exception):
+    """Dilempar kalau tabel Pemasukan sudah terisi sampai baris terakhir yang dihitung rumus."""
 
 
 def sekarang():
@@ -80,6 +88,23 @@ def simpan_pengeluaran(kategori, nama, nominal):
     return ws.title, baris
 
 
+def simpan_pemasukan(sumber, nominal):
+    """Isi baris kosong pertama di tabel Pemasukan (kolom B-D) pada tab bulan ini.
+
+    Mengembalikan (nama tab, nomor baris).
+    """
+    ws = _tab_bulan()                     # melempar TabTidakAda kalau tab belum ada
+    isi = ws.col_values(2)                # kolom B (Source); indeks 0 = baris 1
+    for baris in range(PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR + 1):
+        if baris > len(isi) or isi[baris - 1].strip() == '':
+            break
+    else:
+        raise TabelPenuh()
+    ws.update(range_name=f'B{baris}:D{baris}',
+              values=[[sumber, _tanggal(), nominal]], raw=False)
+    return ws.title, baris
+
+
 def ambil_pengeluaran_hari_ini():
     """Daftar (kategori, nama barang, nilai) untuk hari ini dari semua tabel."""
     ws = _tab_bulan()
@@ -97,36 +122,3 @@ def ambil_pengeluaran_hari_ini():
             except (TypeError, ValueError):
                 continue      # baris kosong atau bukan tanggal
     return daftar
-
-# Tempel potongan ini ke penyimpanan.py (di bawah simpan_pengeluaran).
-# Diasumsikan penyimpanan.py memakai gspread. Kalau beda, kirim isi
-# penyimpanan.py supaya bisa disesuaikan persis.
- 
-PEMASUKAN_BARIS_AWAL = 10    # baris 9 = "Sisa Bulanan", jangan ditimpa
-PEMASUKAN_BARIS_AKHIR = 31   # batas rumus L11 (B10:B31)
- 
- 
-class TabelPenuh(Exception):
-    """Tabel Pemasukan sudah terisi sampai baris terakhir yang dihitung rumus."""
- 
- 
-def simpan_pemasukan(sumber, nominal):
-    """Isi baris kosong pertama di tabel Pemasukan (kolom B-D) pada tab bulan ini.
-    Mengembalikan (nama_tab, nomor_baris)."""
- 
-    # GANTI baris ini dengan cara simpan_pengeluaran mengambil tab bulan ini
-    # (fungsi/baris yang sama yang melempar TabTidakAda kalau tab belum ada).
-    ws = simpan_pengeluaran()
- 
-    kolom_b = ws.col_values(2)   # isi kolom B (Source) dari baris 1; sel kosong = ''
-    for baris in range(PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR + 1):
-        if baris > len(kolom_b) or not kolom_b[baris - 1].strip():
-            break
-    else:
-        raise TabelPenuh()
- 
-    tanggal = sekarang().date().isoformat()   # contoh: 2026-10-24
-    ws.update(range_name='B' + str(baris) + ':D' + str(baris),
-              values=[[sumber, tanggal, nominal]],
-              value_input_option='RAW')       # RAW: tanggal tetap teks, nominal tetap angka
-    return ws.title, baris
