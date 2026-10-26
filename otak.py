@@ -1,16 +1,19 @@
 import re
 import traceback
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+
+import requests
 
 from kalender import event_hari_ini, tambah_event
-from penyimpanan import (GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah, TabelPenuh,
-                         TabTidakAda,
+from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah,
+                         TabelPenuh, TabTidakAda,
                          ambil_pengeluaran_hari_ini, ambil_riwayat, ambil_saldo,
-                         ambil_total_kategori, baca_pengaturan,
+                         ambil_total_kategori, baca_deadline, baca_pengaturan,
                          batalkan_terakhir, nama_bulan, pengingat_sudah_dicek,
                          sekarang, simpan_pemasukan, simpan_pemasukan_bank,
-                         simpan_pengeluaran, simpan_riwayat,
-                         tandai_pengingat_dicek, tulis_pengaturan)
+                         simpan_pengeluaran, simpan_riwayat, status_sudah,
+                         status_tandai, tandai_pengingat_dicek, tulis_pengaturan,
+                         ubah_deadline)
 
 # Kata kategori yang boleh diketik -> nama tabel di spreadsheet
 KATEGORI_ALIAS = {
@@ -62,6 +65,46 @@ NOMINAL_MINIMAL_BEBAS = 1000
 
 # Batas jumlah baris dalam satu pesan, supaya tidak melewati kuota Google Sheets.
 MAKS_BARIS = 10
+
+# Pengingat deadline (/deadline). Tiap tingkat dikirim sekali:
+#   ('h3', 'hari', 3) = pagi hari (jam JAM_PENGINGAT_HARI) pada 3 hari sebelum tanggal deadline
+#   ('j3', 'jam', 3)  = tepat 3 jam sebelum waktu deadline
+# Tingkat yang waktunya sudah lewat saat deadline dibuat tidak dikirim.
+TINGKAT_DEADLINE = (('h3', 'hari', 3), ('h1', 'hari', 1), ('j3', 'jam', 3))
+JAM_PENGINGAT_HARI = 8
+MAKS_JUDUL_DEADLINE = 100
+
+# Pesan pagi: dikirim sekali sehari antara JAM_PAGI dan JAM_PAGI_BATAS (WIB). Kalau bot
+# baru hidup setelah JAM_PAGI_BATAS, pesan hari itu dilewati. /pagi menampilkannya kapan saja.
+JAM_PAGI = 7
+JAM_PAGI_BATAS = 12
+LOKASI_CUACA = ('Yogyakarta', -7.80, 110.37)      # nama, lintang, bujur
+JUMLAH_DEADLINE_PAGI = 3
+
+NAMA_HARI = ('Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu')
+HARI_PENDEK = ('Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min')
+HARI_KATA = {'senin': 0, 'selasa': 1, 'rabu': 2, 'kamis': 3, 'jumat': 4, "jum'at": 4,
+             'sabtu': 5, 'minggu': 6, 'ahad': 6}
+
+# Kode cuaca WMO dari Open-Meteo -> (deskripsi, ikon).
+CUACA_WMO = {
+    0: ('cerah', '☀️'), 1: ('cerah berawan', '🌤️'), 2: ('berawan sebagian', '⛅'),
+    3: ('mendung', '☁️'), 45: ('berkabut', '🌫️'), 48: ('berkabut', '🌫️'),
+    51: ('gerimis ringan', '🌦️'), 53: ('gerimis', '🌦️'), 55: ('gerimis lebat', '🌦️'),
+    56: ('gerimis dingin', '🌦️'), 57: ('gerimis dingin', '🌦️'),
+    61: ('hujan ringan', '🌧️'), 63: ('hujan sedang', '🌧️'), 65: ('hujan lebat', '🌧️'),
+    66: ('hujan dingin', '🌧️'), 67: ('hujan dingin', '🌧️'),
+    80: ('hujan lokal ringan', '🌦️'), 81: ('hujan lokal', '🌧️'),
+    82: ('hujan lokal deras', '🌧️'),
+    95: ('badai petir', '⛈️'), 96: ('badai petir dan hujan es', '⛈️'),
+    99: ('badai petir dan hujan es', '⛈️'),
+}
+
+PETUNJUK_DEADLINE = ('Tambah: /deadline <judul> <tanggal> <jam>\n'
+                     'Contoh: /deadline DML 3 jumat 23:59\n'
+                     'Tanggal: hariini, besok, lusa, nama hari (jumat), atau 30/10 (30/10/2026)\n'
+                     'Lihat: /deadline\n'
+                     'Selesai: /deadline selesai <nomor atau judul>')
 
 # Nama sumber yang ditulis di tabel Pemasukan.
 # Rumus saldo BNI (sel L11) mencari kata "BNI", jadi kata itu harus tetap ada.
@@ -597,21 +640,415 @@ def perintah_todo(argumen):
     return '📅 Ditambahkan: ' + bagian[2] + ' (' + waktu + ')'
 
 
+# ---------------------------------------------------------------------------
+# /deadline dan pengingatnya
+# ---------------------------------------------------------------------------
+
+def baca_jam(kata):
+    """'23:59' atau '23.59' -> time. None kalau tidak terbaca."""
+    cocok = re.fullmatch(r'(\d{1,2})[:.](\d{2})', kata)
+    if not cocok:
+        return None
+    jam, menit = int(cocok.group(1)), int(cocok.group(2))
+    if jam > 23 or menit > 59:
+        return None
+    return time(jam, menit)
+
+
+def baca_tanggal_deadline(kata):
+    """'hariini', 'besok', 'lusa', nama hari ('jumat' = Jumat terdekat, bisa hari ini),
+    '30/10' atau '30/10/2026' -> date. None kalau tidak terbaca."""
+    hari_ini = sekarang().date()
+    kata = kata.lower()
+    if kata == 'hariini':
+        return hari_ini
+    if kata == 'besok':
+        return hari_ini + timedelta(days=1)
+    if kata == 'lusa':
+        return hari_ini + timedelta(days=2)
+    if kata in HARI_KATA:
+        return hari_ini + timedelta(days=(HARI_KATA[kata] - hari_ini.weekday()) % 7)
+    cocok = re.fullmatch(r'(\d{1,2})/(\d{1,2})(?:/(\d{2}|\d{4}))?', kata)
+    if not cocok:
+        return None
+    hari, bulan, tahun = int(cocok.group(1)), int(cocok.group(2)), cocok.group(3)
+    try:
+        if tahun:
+            tahun = int(tahun)
+            return date(tahun + 2000 if tahun < 100 else tahun, bulan, hari)
+        tanggal = date(hari_ini.year, bulan, hari)
+        if tanggal < hari_ini:                  # sudah lewat tahun ini, berarti tahun depan
+            tanggal = date(hari_ini.year + 1, bulan, hari)
+        return tanggal
+    except ValueError:
+        return None
+
+
+def baca_deadline_dari_teks(argumen):
+    """'DML 3 jumat 23:59' atau 'jumat 23:59 DML 3' -> (judul, kata tanggal, jam), atau None."""
+    bagian = argumen.split()
+    if len(bagian) < 3:
+        return None
+    jam = baca_jam(bagian[-1])
+    if jam is not None and baca_tanggal_deadline(bagian[-2]) is not None:
+        return ' '.join(bagian[:-2]), bagian[-2], jam
+    jam = baca_jam(bagian[1])
+    if jam is not None and baca_tanggal_deadline(bagian[0]) is not None:
+        return ' '.join(bagian[2:]), bagian[0], jam
+    return None
+
+
+def waktu_kirim(tingkat, waktu):
+    """Kapan pengingat `tingkat` dikirim untuk deadline pada `waktu`."""
+    _, jenis, jumlah = tingkat
+    if jenis == 'hari':
+        return datetime.combine(waktu.date() - timedelta(days=jumlah),
+                                time(JAM_PENGINGAT_HARI, 0), tzinfo=WIB)
+    return waktu - timedelta(hours=jumlah)
+
+
+def teks_waktu(waktu):
+    """'Jum 30/10 23:59' (tahunnya ikut ditulis kalau bukan tahun ini)."""
+    waktu = waktu.astimezone(WIB)
+    format_tanggal = '%d/%m' if waktu.year == sekarang().year else '%d/%m/%Y'
+    return HARI_PENDEK[waktu.weekday()] + ' ' + waktu.strftime(format_tanggal + ' %H:%M')
+
+
+def teks_sisa(waktu, kini):
+    """Sisa waktu sampai `waktu`: '45 menit lagi', '5 jam 20 menit lagi', '4 hari lagi'."""
+    menit_total = int((waktu - kini).total_seconds() // 60)
+    if menit_total < 1:
+        return 'sekarang'
+    if menit_total < 60:
+        return str(menit_total) + ' menit lagi'
+    if menit_total < 24 * 60:
+        jam, menit = divmod(menit_total, 60)
+        return str(jam) + ' jam' + (' ' + str(menit) + ' menit' if menit else '') + ' lagi'
+    hari, sisa_menit = divmod(menit_total, 24 * 60)
+    jam = sisa_menit // 60
+    return str(hari) + ' hari' + (' ' + str(jam) + ' jam' if jam and hari < 3 else '') + ' lagi'
+
+
+def deadline_mendatang():
+    """Deadline yang belum lewat, dari yang paling dekat: [(waktu, entri), ...]."""
+    kini = sekarang()
+    hasil = []
+    for d in baca_deadline():
+        try:
+            waktu = datetime.fromisoformat(d['waktu'])
+            judul = d['judul']
+        except (KeyError, ValueError, TypeError):
+            continue                                # entri rusak dilewati
+        if waktu > kini and judul:
+            hasil.append((waktu, d))
+    hasil.sort(key=lambda pasangan: pasangan[0])
+    return hasil
+
+
+def daftar_deadline():
+    daftar = deadline_mendatang()
+    if not daftar:
+        return 'Belum ada deadline.\n' + PETUNJUK_DEADLINE
+    kini = sekarang()
+    baris = ['⏳ Deadline (' + str(len(daftar)) + ')']
+    for nomor, (waktu, d) in enumerate(daftar, 1):
+        baris.append(str(nomor) + '. ' + d['judul'] + ' — ' + teks_waktu(waktu) +
+                     ' (' + teks_sisa(waktu, kini) + ')')
+    baris.append('Selesai: /deadline selesai <nomor atau judul>')
+    return '\n'.join(baris)
+
+
+def tambah_deadline(argumen):
+    hasil = baca_deadline_dari_teks(argumen)
+    if hasil is None:
+        return 'Format deadline tidak terbaca.\n' + PETUNJUK_DEADLINE
+    judul, kata_tanggal, jam = hasil
+    judul = judul[:MAKS_JUDUL_DEADLINE]
+    kini = sekarang()
+    waktu = datetime.combine(baca_tanggal_deadline(kata_tanggal), jam, tzinfo=WIB)
+    if waktu <= kini:
+        if kata_tanggal.lower() not in HARI_KATA:
+            return 'Waktu itu (' + teks_waktu(waktu) + ') sudah lewat. Cek tanggal dan jamnya.'
+        waktu += timedelta(days=7)           # "jumat" setelah jam Jumat lewat = Jumat depan
+
+    # Tingkat pengingat yang waktunya sudah lewat langsung dianggap terkirim.
+    terkirim = [t[0] for t in TINGKAT_DEADLINE if waktu_kirim(t, waktu) <= kini]
+    entri = {'judul': judul, 'waktu': waktu.isoformat(timespec='seconds'), 'terkirim': terkirim}
+
+    def tambah(daftar):
+        if any(d.get('judul', '').lower() == judul.lower() and d.get('waktu') == entri['waktu']
+               for d in daftar):
+            return False
+        daftar.append(entri)
+        return True
+
+    if not ubah_deadline(tambah):
+        return 'Deadline itu sudah ada: ' + judul + ' (' + teks_waktu(waktu) + ')'
+    akan = [teks_waktu(waktu_kirim(t, waktu)) for t in TINGKAT_DEADLINE if t[0] not in terkirim]
+    baris = ['✅ Deadline dicatat: ' + judul,
+             '📌 ' + teks_waktu(waktu) + ' (' + teks_sisa(waktu, kini) + ')']
+    if akan:
+        baris.append('🔔 Pengingat: ' + ' · '.join(akan))
+    else:
+        baris.append('🔔 Tidak ada pengingat tersisa, deadline-nya sudah terlalu dekat.')
+    return '\n'.join(baris)
+
+
+def selesaikan_deadline(kunci):
+    kunci = kunci.strip()
+    if not kunci:
+        return 'Format: /deadline selesai <nomor atau judul>\nLihat nomornya dengan /deadline'
+    daftar = deadline_mendatang()
+    if kunci.isdigit():
+        nomor = int(kunci)
+        if not 1 <= nomor <= len(daftar):
+            return 'Nomor ' + kunci + ' tidak ada. Lihat daftar dengan /deadline'
+        cocok = [daftar[nomor - 1]]
+    else:
+        cocok = [p for p in daftar if kunci.lower() in p[1]['judul'].lower()]
+        persis = [p for p in cocok if p[1]['judul'].lower() == kunci.lower()]
+        if len(persis) == 1:
+            cocok = persis
+        if not cocok:
+            return 'Tidak ada deadline yang judulnya mengandung "' + kunci + '". Lihat /deadline'
+        if len(cocok) > 1:
+            baris = ['Ada ' + str(len(cocok)) + ' deadline yang cocok. Tulis judulnya lebih lengkap:']
+            baris += ['• ' + p[1]['judul'] + ' (' + teks_waktu(p[0]) + ')' for p in cocok]
+            return '\n'.join(baris)
+    _, terpilih = cocok[0]
+
+    def hapus(isi):
+        for i, d in enumerate(isi):
+            if d.get('judul') == terpilih['judul'] and d.get('waktu') == terpilih['waktu']:
+                del isi[i]
+                return True
+        return False
+
+    ubah_deadline(hapus)
+    return '✅ Deadline selesai: ' + terpilih['judul']
+
+
+def perintah_deadline(argumen):
+    """/deadline DML 3 jumat 23:59 | /deadline | /deadline selesai <nomor atau judul>"""
+    bagian = argumen.split()
+    if not bagian:
+        return daftar_deadline()
+    if bagian[0].lower() in ('selesai', 'hapus', 'batal'):
+        return selesaikan_deadline(' '.join(bagian[1:]))
+    return tambah_deadline(argumen)
+
+
+def teks_pengingat_deadline(d, waktu, tingkat, kini):
+    ikon = '🚨' if tingkat[1] == 'jam' else '⏳'
+    terlambat = kini - waktu_kirim(tingkat, waktu) > timedelta(hours=3)   # bot sempat mati
+    if tingkat[1] == 'hari' and not terlambat:
+        sisa = 'besok' if tingkat[2] == 1 else str(tingkat[2]) + ' hari lagi'
+    else:
+        sisa = teks_sisa(waktu, kini)
+    return (ikon + ' Deadline ' + d['judul'] + ': ' + sisa + ' (' + teks_waktu(waktu) + ')\n'
+            'Kalau sudah selesai: /deadline selesai ' + d['judul'])
+
+
+def pengingat_deadline():
+    """Untuk penjadwal: teks pengingat deadline yang jatuh tempo sekarang, atau None.
+    Tiap tingkat hanya dikirim sekali. Kalau beberapa tingkat sekaligus jatuh tempo
+    (misalnya bot sempat mati), hanya yang paling mendesak yang dikirim. Deadline yang
+    sudah lewat dibuang dari daftar."""
+    kini = sekarang()
+
+    def periksa(daftar):
+        pesan = []
+        daftar[:] = [d for d in daftar if _belum_lewat(d, kini)]
+        for d in daftar:
+            waktu = datetime.fromisoformat(d['waktu'])
+            terkirim = d.setdefault('terkirim', [])
+            jatuh = [t for t in TINGKAT_DEADLINE
+                     if t[0] not in terkirim and waktu_kirim(t, waktu) <= kini]
+            if not jatuh:
+                continue
+            terkirim.extend(t[0] for t in jatuh)
+            mendesak = max(jatuh, key=lambda t: waktu_kirim(t, waktu))
+            pesan.append(teks_pengingat_deadline(d, waktu, mendesak, kini))
+        return pesan
+
+    pesan = ubah_deadline(periksa)
+    return '\n\n'.join(pesan) if pesan else None
+
+
+def _belum_lewat(d, kini):
+    try:
+        return datetime.fromisoformat(d['waktu']) > kini
+    except (KeyError, ValueError, TypeError):
+        return False                                # entri rusak ikut dibuang
+
+
+# ---------------------------------------------------------------------------
+# Pesan pagi
+# ---------------------------------------------------------------------------
+
+def _ke_datetime(nilai):
+    if isinstance(nilai, datetime):
+        return nilai
+    if isinstance(nilai, str) and len(nilai) > 10:      # "2026-10-26" saja = tanpa jam
+        try:
+            return datetime.fromisoformat(nilai)
+        except ValueError:
+            return None
+    return None
+
+
+def _awalan_jam(nilai):
+    waktu = _ke_datetime(nilai)
+    if waktu is None:
+        return ''
+    if waktu.tzinfo is not None:
+        waktu = waktu.astimezone(WIB)
+    return waktu.strftime('%H:%M') + ' '
+
+
+def format_event(e):
+    """Satu event dari kalender.event_hari_ini() -> 'HH:MM judul'. Mengenali event Google
+    Calendar (dict dengan 'summary' dan 'start'), pasangan (judul, waktu) atau (waktu,
+    judul), dan teks biasa. Bentuk lain ditampilkan apa adanya."""
+    if isinstance(e, str):
+        return e
+    if isinstance(e, dict):
+        judul = e.get('summary') or e.get('judul') or e.get('title') or '(tanpa judul)'
+        mulai = e.get('start', e.get('mulai', e.get('waktu')))
+        if isinstance(mulai, dict):
+            if mulai.get('dateTime'):
+                mulai = mulai['dateTime']
+            else:                                   # event seharian hanya punya 'date'
+                return '(seharian) ' + str(judul)
+        return _awalan_jam(mulai) + str(judul)
+    if isinstance(e, (tuple, list)) and len(e) >= 2:
+        if _ke_datetime(e[1]) is not None:
+            return _awalan_jam(e[1]) + str(e[0])
+        return _awalan_jam(e[0]) + str(e[1])
+    return str(e)
+
+
+def teks_agenda_hari_ini():
+    try:
+        daftar = list(event_hari_ini())
+    except Exception:
+        traceback.print_exc()
+        return '📅 Agenda hari ini: tidak terbaca dari kalender.'
+    if not daftar:
+        return '📅 Agenda hari ini: kosong.'
+    return '📅 Agenda hari ini:\n' + '\n'.join('• ' + format_event(e) for e in daftar)
+
+
+def ambil_cuaca():
+    """Ringkasan cuaca hari ini dari Open-Meteo (gratis, tanpa API key), atau None kalau gagal."""
+    nama, lintang, bujur = LOKASI_CUACA
+    try:
+        r = requests.get('https://api.open-meteo.com/v1/forecast', timeout=10, params={
+            'latitude': lintang, 'longitude': bujur, 'timezone': 'Asia/Jakarta',
+            'forecast_days': 1,
+            'daily': 'weather_code,temperature_2m_max,temperature_2m_min,'
+                     'precipitation_probability_max'})
+        r.raise_for_status()
+        harian = r.json()['daily']
+        kode = harian['weather_code'][0]
+        suhu_min = harian['temperature_2m_min'][0]
+        suhu_maks = harian['temperature_2m_max'][0]
+        hujan = harian['precipitation_probability_max'][0]
+    except (requests.exceptions.RequestException, KeyError, IndexError, TypeError, ValueError):
+        traceback.print_exc()
+        return None
+    deskripsi, ikon = CUACA_WMO.get(kode, ('cuaca tidak diketahui', '🌡️'))
+    teks = ikon + ' Cuaca ' + nama + ': ' + deskripsi
+    if suhu_min is not None and suhu_maks is not None:
+        teks += ', ' + str(round(suhu_min)) + '–' + str(round(suhu_maks)) + '°C'
+    if hujan is not None:
+        teks += ', peluang hujan ' + str(round(hujan)) + '%'
+        if hujan >= 50:
+            teks += ' (bawa payung)'
+    return teks
+
+
+def teks_deadline_pagi():
+    daftar = deadline_mendatang()[:JUMLAH_DEADLINE_PAGI]
+    if not daftar:
+        return None
+    kini = sekarang()
+    baris = ['⏳ Deadline terdekat:']
+    for waktu, d in daftar:
+        baris.append('• ' + d['judul'] + ' — ' + teks_waktu(waktu) + ' (' + teks_sisa(waktu, kini) + ')')
+    return '\n'.join(baris)
+
+
+def teks_uang_pagi():
+    try:
+        tab, angka = ambil_saldo()
+    except TabTidakAda as e:
+        return ('💰 Saldo: tab bulan ' + str(e) + ' belum ada di spreadsheet '
+                '(duplikat tab Template dulu).')
+    except Exception:
+        traceback.print_exc()
+        return '💰 Saldo: tidak terbaca dari spreadsheet.'
+    bagian_saldo = ('Sisa Uang', 'BNI', 'Mandiri')
+    bagian = []
+    if 'Sisa Uang' in angka:
+        bagian.append('Sisa uang ' + rupiah(int(round(angka['Sisa Uang']))))
+    if all(label in angka for label in bagian_saldo):
+        bagian.append('Total saldo ' + rupiah(sum(int(round(angka[l])) for l in bagian_saldo)))
+    if not bagian:
+        return '💰 Saldo: angkanya tidak ditemukan di tab ' + tab + '.'
+    return '💰 ' + ' · '.join(bagian)
+
+
+def susun_pesan_pagi():
+    """Pesan pagi lengkap. Tiap bagian diambil sendiri-sendiri: yang gagal diganti catatan
+    singkat, bagian lain tetap tampil."""
+    kini = sekarang()
+    bagian = ['☀️ Selamat pagi! ' + NAMA_HARI[kini.weekday()] + ', ' + str(kini.day) + ' ' +
+              BULAN[kini.month - 1] + ' ' + str(kini.year),
+              teks_agenda_hari_ini(),
+              ambil_cuaca() or '🌡️ Cuaca: tidak terbaca.']
+    deadline = teks_deadline_pagi()
+    if deadline:
+        bagian.append(deadline)
+    bagian.append(teks_uang_pagi())
+    return '\n\n'.join(bagian)
+
+
+def perintah_pagi(argumen):
+    """/pagi -> pesan pagi sekarang juga (tidak mempengaruhi pengiriman otomatis)."""
+    return susun_pesan_pagi()
+
+
+def pengingat_pagi():
+    """Untuk penjadwal: pesan pagi sekali sehari, antara JAM_PAGI dan JAM_PAGI_BATAS."""
+    waktu = sekarang()
+    if not JAM_PAGI <= waktu.hour < JAM_PAGI_BATAS:
+        return None
+    hari = waktu.strftime('%Y-%m-%d')
+    if status_sudah('pesan_pagi', hari):
+        return None
+    teks = susun_pesan_pagi()
+    status_tandai('pesan_pagi', hari)
+    return teks
+
+
 def perintah_bantuan(argumen):
     pintasan = ', '.join(daftar_pintasan()) or 'belum ada'
     return ('Perintah:\n'
-            '/out <nominal> <kategori> <nama>  (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
-            '/qris <nominal> <kategori> <nama>\n'
-            '/pintasan  (lihat, tambah, ubah, hapus pintasan)\n'
-            '/batas  (batas bulanan per kategori)\n'
-            '/tarik <nominal>  (tarik tunai dari BNI)\n'
-            '/topup <rekening> <nominal>\n'
-            '/saldo  (sisa uang, saldo BNI dan Mandiri)\n'
-            '/rekap  (total per kategori bulan ini dan selisih dengan bulan lalu)\n'
-            '/hariini  (pengeluaran hari ini dan totalnya)\n'
-            '/riwayat [jumlah]  (catatan terakhir, urutan yang dibatalkan /undo)\n'
-            '/undo  (batalkan catatan terakhir)\n'
-            '/todo <hariini|besok|lusa|14/10> <jam> <judul>')
+            '/out (kategori: jajan, alat, mingguan, bulanan, hiburan)\n'
+            '/qris\n'
+            '/pintasan\n'
+            '/batas (batas bulanan per kategori)\n'
+            '/tarik (BNI)\n'
+            '/topup\n'
+            '/saldo\n'
+            '/rekap\n'
+            '/hariini\n'
+            '/riwayat\n'
+            '/undo\n'
+            '/deadline (tugas dan pengingatnya)\n'
+            '/pagi (pesan pagi sekarang)\n'
+            '/todo')
 
 
 PERINTAH = {
@@ -626,6 +1063,8 @@ PERINTAH = {
     '/hariini': perintah_hariini,
     '/riwayat': perintah_riwayat,
     '/undo': perintah_undo,
+    '/deadline': perintah_deadline,
+    '/pagi': perintah_pagi,
     '/todo': perintah_todo,
     '/bantuan': perintah_bantuan,
 }
@@ -742,7 +1181,7 @@ def proses_pesan(teks):
         return pesan_kesalahan(e)
 
 
-def pengingat_pengeluaran():
+def pengingat_catat_pengeluaran():
     """Untuk penjadwal: panggil berkala (misalnya tiap menit) dan kirim hasilnya
     kalau bukan None.
 
@@ -774,3 +1213,26 @@ def pengingat_pengeluaran():
         return None
     return ('🔔 Belum ada pengeluaran yang dicatat hari ini. '
             'Catat dengan /out atau /qris, atau abaikan kalau memang tidak ada.' + tambahan)
+
+
+def pengingat_berkala():
+    """Pintu masuk untuk penjadwal: panggil tiap menit dan kirim hasilnya kalau bukan None.
+
+    Mengumpulkan semua pengingat yang jatuh tempo: pesan pagi, pengingat deadline, dan
+    pengingat "belum catat pengeluaran". Tiap sumber dijaga sendiri-sendiri, jadi satu yang
+    error tidak menghalangi yang lain."""
+    pesan = []
+    for sumber in (pengingat_pagi, pengingat_deadline, pengingat_catat_pengeluaran):
+        try:
+            teks = sumber()
+        except Exception:
+            traceback.print_exc()
+            continue
+        if teks:
+            pesan.append(teks)
+    return '\n\n'.join(pesan) if pesan else None
+
+
+# Nama lama tetap dipakai supaya penjadwal yang sudah memanggil pengingat_pengeluaran()
+# otomatis ikut mendapat pesan pagi dan pengingat deadline tanpa perubahan di tempat lain.
+pengingat_pengeluaran = pengingat_berkala

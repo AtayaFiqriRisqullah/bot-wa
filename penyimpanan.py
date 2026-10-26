@@ -57,6 +57,9 @@ STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status.j
 # Pengaturan yang diubah lewat chat (daftar pintasan dan batas bulanan per kategori).
 PENGATURAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pengaturan.json')
 
+# Daftar /deadline beserta tingkat pengingat yang sudah terkirim untuk masing-masing.
+DEADLINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deadline.json')
+
 # Gangguan jaringan sesaat: koneksi di-reset, sinyal HP pindah, timeout, dan sejenisnya.
 # Panggilan ke Google yang gagal karena ini aman diulang, sebab semua panggilan di file
 # ini idempotent (membaca, menulis ke rentang yang sama persis, atau mengosongkan rentang),
@@ -107,6 +110,7 @@ _buku = _coba(_akun.open_by_key, SHEET_ID)
 _kunci_riwayat = threading.Lock()
 _kunci_status = threading.Lock()
 _kunci_pengaturan = threading.Lock()
+_kunci_deadline = threading.Lock()
 
 
 class TabTidakAda(Exception):
@@ -330,6 +334,49 @@ def tandai_pengingat_dicek(tanggal):
         status['pengingat_pengeluaran'] = tanggal
         with open(STATUS_FILE, 'w', encoding='utf-8') as f:
             json.dump(status, f, ensure_ascii=False, indent=1)
+
+
+def status_sudah(kunci, tanggal):
+    """True kalau status `kunci` (misalnya 'pesan_pagi') sudah ditandai untuk `tanggal`."""
+    with _kunci_status:
+        return _baca_status().get(kunci) == tanggal
+
+
+def status_tandai(kunci, tanggal):
+    with _kunci_status:
+        status = _baca_status()
+        status[kunci] = tanggal
+        with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(status, f, ensure_ascii=False, indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Daftar deadline
+# ---------------------------------------------------------------------------
+
+def baca_deadline():
+    """Daftar deadline: [{'judul': ..., 'waktu': '2026-10-30T23:59:00+07:00',
+    'terkirim': ['h3']}, ...]. Hanya untuk dibaca; ubah lewat ubah_deadline."""
+    with _kunci_deadline:
+        return list(_baca_json(DEADLINE_FILE).get('daftar', []))
+
+
+def ubah_deadline(ubah):
+    """Baca daftar deadline, jalankan ubah(daftar) (boleh mengubah daftar di tempat),
+    lalu simpan kalau isinya berubah. Mengembalikan apa yang dikembalikan ubah().
+    Ditulis ke file sementara dulu lalu ditukar, supaya file tidak rusak kalau bot mati."""
+    with _kunci_deadline:
+        data = _baca_json(DEADLINE_FILE)
+        daftar = data.get('daftar', [])
+        sebelum = json.dumps(daftar, ensure_ascii=False, sort_keys=True)
+        hasil = ubah(daftar)
+        if json.dumps(daftar, ensure_ascii=False, sort_keys=True) != sebelum:
+            data['daftar'] = daftar
+            sementara = DEADLINE_FILE + '.tmp'
+            with open(sementara, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(sementara, DEADLINE_FILE)
+        return hasil
 
 
 # ---------------------------------------------------------------------------
