@@ -342,11 +342,18 @@ def perintah_topup(argumen):
 def perintah_saldo(argumen):
     """/saldo -> sisa uang dan saldo bank, dibaca dari hasil rumus di spreadsheet."""
     tab, angka = ambil_saldo()
+    bagian_saldo = ('Sisa Uang', 'BNI', 'Mandiri')
     baris = []
-    for label in ('Sisa Uang', 'BNI', 'Mandiri', 'Pengeluaran'):
+    for label in bagian_saldo:
         if label in angka:
-            teks = label if label != 'Pengeluaran' else 'Pengeluaran bulan ini'
-            baris.append(teks + ': ' + rupiah(int(round(angka[label]))))
+            baris.append(label + ': ' + rupiah(int(round(angka[label]))))
+    # Total saldo = uang tunai + semua rekening. Hanya ditampilkan kalau ketiganya terbaca,
+    # supaya totalnya tidak menyesatkan kalau ada satu angka yang tidak ketemu di sheet.
+    if all(label in angka for label in bagian_saldo):
+        total = sum(int(round(angka[label])) for label in bagian_saldo)
+        baris.append('Total saldo: ' + rupiah(total))
+    if 'Pengeluaran' in angka:
+        baris.append('Pengeluaran bulan ini: ' + rupiah(int(round(angka['Pengeluaran']))))
     if not baris:
         return ('Angka saldo tidak ditemukan di tab ' + tab + '. '
                 'Cek posisi tabel Hasil Akhir dan Sisa Saldo Bank '
