@@ -1,10 +1,13 @@
 import json
 import os
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import gspread
-from gspread.exceptions import WorksheetNotFound
+import requests
+from google.auth.exceptions import TransportError
+from gspread.exceptions import APIError, WorksheetNotFound
 from gspread.utils import a1_to_rowcol
 
 from config import SHEET_ID
@@ -54,8 +57,53 @@ STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status.j
 # Pengaturan yang diubah lewat chat (daftar pintasan dan batas bulanan per kategori).
 PENGATURAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pengaturan.json')
 
+# Gangguan jaringan sesaat: koneksi di-reset, sinyal HP pindah, timeout, dan sejenisnya.
+# Panggilan ke Google yang gagal karena ini aman diulang, sebab semua panggilan di file
+# ini idempotent (membaca, menulis ke rentang yang sama persis, atau mengosongkan rentang),
+# jadi mengulangnya tidak membuat catatan dobel.
+GAGAL_JARINGAN = (TransportError, requests.exceptions.RequestException,
+                  ConnectionError, TimeoutError)
+JEDA_ULANG = (1, 2, 4)    # detik menunggu sebelum percobaan ke-2, ke-3, dan ke-4
+
+
+def _layak_diulang(e):
+    if isinstance(e, APIError):               # error dari server Google: ulangi hanya kalau 5xx
+        return e.response.status_code in (500, 502, 503, 504)
+    return isinstance(e, GAGAL_JARINGAN)
+
+
+def _coba(fungsi, *args, **kwargs):
+    """Jalankan satu panggilan ke Google; kalau gagal karena jaringan, ulangi."""
+    for jeda in JEDA_ULANG:
+        try:
+            return fungsi(*args, **kwargs)
+        except (APIError,) + GAGAL_JARINGAN as e:
+            if not _layak_diulang(e):
+                raise
+            print('[jaringan] ' + type(e).__name__ + ', mengulang dalam ' + str(jeda) + ' detik')
+            time.sleep(jeda)
+    return fungsi(*args, **kwargs)            # percobaan terakhir: kalau gagal lagi, errornya naik
+
+
+class _WsAman:
+    """Pembungkus worksheet: setiap panggilan ke Google (col_values, update, get, ...)
+    otomatis lewat _coba. Atribut biasa seperti .title diteruskan apa adanya."""
+
+    def __init__(self, ws):
+        self._ws = ws
+
+    def __getattr__(self, nama):
+        atribut = getattr(self._ws, nama)
+        if not callable(atribut):
+            return atribut
+
+        def panggil(*args, **kwargs):
+            return _coba(atribut, *args, **kwargs)
+        return panggil
+
+
 _akun = gspread.service_account_from_dict(muat_kunci())
-_buku = _akun.open_by_key(SHEET_ID)
+_buku = _coba(_akun.open_by_key, SHEET_ID)
 _kunci_riwayat = threading.Lock()
 _kunci_status = threading.Lock()
 _kunci_pengaturan = threading.Lock()
@@ -86,7 +134,7 @@ def _tanggal(tanggal=None):
 
 def _tab(nama):
     try:
-        return _buku.worksheet(nama)
+        return _WsAman(_coba(_buku.worksheet, nama))
     except WorksheetNotFound:
         raise TabTidakAda(nama)
 

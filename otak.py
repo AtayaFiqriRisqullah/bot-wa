@@ -3,7 +3,8 @@ import traceback
 from datetime import date, datetime, timedelta
 
 from kalender import event_hari_ini, tambah_event
-from penyimpanan import (RIWAYAT_MAKS, WIB, RiwayatBerubah, TabelPenuh, TabTidakAda,
+from penyimpanan import (GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah, TabelPenuh,
+                         TabTidakAda,
                          ambil_pengeluaran_hari_ini, ambil_riwayat, ambil_saldo,
                          ambil_total_kategori, baca_pengaturan,
                          batalkan_terakhir, nama_bulan, pengingat_sudah_dicek,
@@ -639,6 +640,10 @@ def pesan_kesalahan(e):
         return ('Tab bulan ' + nama + ' belum ada di spreadsheet. '
                 'Duplikat tab Template, lalu ganti namanya menjadi ' + nama + '.')
     traceback.print_exc()          # detail lengkap muncul di terminal Python
+    if isinstance(e, GAGAL_JARINGAN):
+        return ('📶 Koneksi ke Google terputus, padahal sudah dicoba ulang beberapa kali. '
+                'Kalau tadi mencatat sesuatu, cek dulu dengan /riwayat sebelum mengirim ulang, '
+                'supaya tidak tercatat dua kali.')
     return '⚠️ Error: ' + type(e).__name__ + ': ' + str(e)
 
 
