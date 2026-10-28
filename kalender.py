@@ -29,6 +29,23 @@ def tambah_event(judul, mulai):
     _layanan.events().insert(calendarId=CALENDAR_ID, body=isi).execute()
 
 
+def tambah_penanda_deadline(judul, tanggal):
+    """Acara seharian berwarna merah berjudul "Due: judul" pada `tanggal` (date).
+
+    Ini acara kalender biasa yang meniru tampilan deadline di Google Tasks. Isian
+    Deadline yang asli tidak bisa dibuat lewat API, dan Calendar API tidak punya jenis
+    acara "tugas".
+    """
+    isi = {
+        'summary': 'Due: ' + judul,
+        'start': {'date': tanggal.isoformat()},
+        'end': {'date': (tanggal + timedelta(days=1)).isoformat()},   # akhir acara seharian eksklusif
+        'colorId': '11',                  # merah (Tomato)
+        'transparency': 'transparent',    # tampil "free", tidak menandai waktu sibuk
+    }
+    _layanan.events().insert(calendarId=CALENDAR_ID, body=isi).execute()
+
+
 def event_hari_ini():
     awal = datetime.now(WIB).replace(hour=0, minute=0, second=0, microsecond=0)
     akhir = awal + timedelta(days=1)

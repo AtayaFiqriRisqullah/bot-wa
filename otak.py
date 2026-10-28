@@ -4,7 +4,8 @@ from datetime import date, datetime, time, timedelta
 
 import requests
 
-from kalender import TugasGagal, event_hari_ini, tambah_event, tambah_tugas
+from kalender import (TugasGagal, event_hari_ini, tambah_event, tambah_penanda_deadline,
+                      tambah_tugas)
 from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah,
                          TabelPenuh, TabTidakAda,
                          ambil_pengeluaran_hari_ini, ambil_riwayat, ambil_saldo,
@@ -638,6 +639,18 @@ def buat_tugas(judul, mulai):
     return '\n✅ Tugas dengan deadline ' + mulai.strftime('%d/%m/%Y') + ' dibuat di Google Tasks'
 
 
+def buat_penanda(judul, mulai):
+    """Penanda merah "Due: judul" seharian di tanggal deadline. Ini acara kalender biasa
+    yang meniru tampilan deadline di Google Tasks (isian Deadline yang asli tidak bisa
+    dibuat lewat API). Kalau gagal, acara dan tugasnya tidak terpengaruh."""
+    try:
+        tambah_penanda_deadline(judul, mulai.date())
+    except Exception as e:
+        traceback.print_exc()
+        return '\n⚠️ Penanda merah belum dibuat (' + type(e).__name__ + ')'
+    return '\n🔴 Penanda merah "Due: ' + judul + '" dibuat di kalender'
+
+
 def perintah_todo(argumen):
     bagian = argumen.split(maxsplit=2)
     if len(bagian) < 3:
@@ -651,7 +664,8 @@ def perintah_todo(argumen):
         return 'Tanggal atau jam tidak terbaca. Contoh: /todo besok 15:00 kumpul DML'
     tambah_event(bagian[2], mulai)
     waktu = mulai.strftime('%d/%m/%Y %H:%M')
-    return '📅 Ditambahkan: ' + bagian[2] + ' (' + waktu + ')' + buat_tugas(bagian[2], mulai)
+    return ('📅 Ditambahkan: ' + bagian[2] + ' (' + waktu + ')' + buat_tugas(bagian[2], mulai) +
+            buat_penanda(bagian[2], mulai))
 
 
 # ---------------------------------------------------------------------------
