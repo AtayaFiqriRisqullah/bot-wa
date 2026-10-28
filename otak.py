@@ -4,7 +4,7 @@ from datetime import date, datetime, time, timedelta
 
 import requests
 
-from kalender import event_hari_ini, tambah_event
+from kalender import TugasGagal, event_hari_ini, tambah_event, tambah_tugas
 from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah,
                          TabelPenuh, TabTidakAda,
                          ambil_pengeluaran_hari_ini, ambil_riwayat, ambil_saldo,
@@ -624,6 +624,20 @@ def baca_tanggal(kata):
     return tgl
 
 
+def buat_tugas(judul, mulai):
+    """Buat tugas Google Tasks dengan deadline di tanggal `mulai`. Google Tasks hanya
+    menyimpan tanggal, jadi jamnya ditulis di catatan tugas. Kalau gagal, acara kalender
+    yang sudah dibuat tidak terpengaruh; hasilnya berupa baris tambahan untuk balasan."""
+    try:
+        tambah_tugas(judul, mulai.date(), 'Deadline pukul ' + mulai.strftime('%H:%M') + ' WIB')
+    except TugasGagal as e:
+        return '\n⚠️ Tugas di Google Tasks belum dibuat: ' + str(e)
+    except Exception as e:
+        traceback.print_exc()
+        return '\n⚠️ Tugas di Google Tasks belum dibuat (' + type(e).__name__ + ')'
+    return '\n✅ Tugas dengan deadline ' + mulai.strftime('%d/%m/%Y') + ' dibuat di Google Tasks'
+
+
 def perintah_todo(argumen):
     bagian = argumen.split(maxsplit=2)
     if len(bagian) < 3:
@@ -637,7 +651,7 @@ def perintah_todo(argumen):
         return 'Tanggal atau jam tidak terbaca. Contoh: /todo besok 15:00 kumpul DML'
     tambah_event(bagian[2], mulai)
     waktu = mulai.strftime('%d/%m/%Y %H:%M')
-    return '📅 Ditambahkan: ' + bagian[2] + ' (' + waktu + ')'
+    return '📅 Ditambahkan: ' + bagian[2] + ' (' + waktu + ')' + buat_tugas(bagian[2], mulai)
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +936,10 @@ def format_event(e):
                 return '(seharian) ' + str(judul)
         return _awalan_jam(mulai) + str(judul)
     if isinstance(e, (tuple, list)) and len(e) >= 2:
+        if isinstance(e[0], str) and re.fullmatch(r'\d{1,2}:\d{2}', e[0]):
+            return e[0] + ' ' + str(e[1])               # bentuk dari kalender.event_hari_ini()
+        if e[0] == 'seharian':
+            return '(seharian) ' + str(e[1])
         if _ke_datetime(e[1]) is not None:
             return _awalan_jam(e[1]) + str(e[0])
         return _awalan_jam(e[0]) + str(e[1])

@@ -11,3 +11,5 @@ VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN', '')
 WA_TOKEN = os.environ.get('WA_TOKEN', '')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID', '')
 APP_SECRET = os.environ.get('APP_SECRET', '')
+TUGAS_URL = 'https://script.google.com/macros/s/AKfycbyi19ZkKu6f40J8mqkzndurbkBNrqaODulpOXJpZjMcIpEtFl3PggAtTt-F2oFAULr3/exec'
+TUGAS_KUNCI = '12345'
