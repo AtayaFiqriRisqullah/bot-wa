@@ -256,22 +256,45 @@ def ambil_saldo():
     return ws.title, hasil
 
 
+def _tanggal_dari_sel(sel):
+    """Isi sel tanggal -> date, atau None kalau tidak terbaca.
+
+    Sel bisa berisi angka (kalau berformat tanggal, Google Sheets menyimpannya sebagai jumlah
+    hari sejak 30/12/1899) atau teks seperti '2026-10-30' dan '30/10/2026' (kalau kolomnya
+    berformat teks biasa, tanggal yang ditulis bot tetap berupa teks). Keduanya dikenali.
+    """
+    if isinstance(sel, bool):
+        return None
+    if isinstance(sel, (int, float)):
+        try:
+            return date(1899, 12, 30) + timedelta(days=int(sel))
+        except (OverflowError, ValueError):
+            return None
+    if isinstance(sel, str):
+        for pola in ('%Y-%m-%d', '%d/%m/%Y'):
+            try:
+                return datetime.strptime(sel.strip(), pola).date()
+            except ValueError:
+                pass
+    return None
+
+
 def ambil_pengeluaran_hari_ini():
     """Daftar (kategori, nama barang, nilai) untuk hari ini dari semua tabel."""
     ws = _tab_bulan()
     rentang = [f'{a}{BARIS_AWAL}:{b}{BARIS_AKHIR}' for a, b in KATEGORI.values()]
     hasil = ws.batch_get(rentang, value_render_option='UNFORMATTED_VALUE')
-    # Di Google Sheets, tanggal disimpan sebagai jumlah hari sejak 30/12/1899.
-    hari_ini = (sekarang().date() - date(1899, 12, 30)).days
+    hari_ini = sekarang().date()
     daftar = []
     for kategori, blok in zip(KATEGORI, hasil):
         for baris in blok:
             nama, tgl, nilai = (list(baris) + ['', '', ''])[:3]
+            if _tanggal_dari_sel(tgl) != hari_ini:
+                continue      # baris kosong, bukan hari ini, atau bukan tanggal
             try:
-                if int(float(tgl)) == hari_ini:
-                    daftar.append((kategori, str(nama), int(float(nilai))))
+                daftar.append((kategori, str(nama), int(float(nilai))))
             except (TypeError, ValueError):
-                continue      # baris kosong atau bukan tanggal
+                continue
     return daftar
 
 
