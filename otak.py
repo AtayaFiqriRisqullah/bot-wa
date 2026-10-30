@@ -4,8 +4,8 @@ from datetime import date, datetime, time, timedelta
 
 import requests
 
-from kalender import (TugasGagal, event_hari_ini, tambah_event, tambah_penanda_deadline,
-                      tambah_tugas)
+from kalender import (GAGAL_KALENDER, TugasGagal, event_hari_ini, tambah_event,
+                      tambah_penanda_deadline, tambah_tugas)
 from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah,
                          TabelPenuh, TabTidakAda,
                          ambil_pengeluaran_hari_ini, ambil_riwayat, ambil_saldo,
@@ -1118,10 +1118,11 @@ def pesan_kesalahan(e):
         return ('Tab bulan ' + nama + ' belum ada di spreadsheet. '
                 'Duplikat tab Template, lalu ganti namanya menjadi ' + nama + '.')
     traceback.print_exc()          # detail lengkap muncul di terminal Python
-    if isinstance(e, GAGAL_JARINGAN):
+    if isinstance(e, GAGAL_JARINGAN + GAGAL_KALENDER):
         return ('📶 Koneksi ke Google terputus, padahal sudah dicoba ulang beberapa kali. '
-                'Kalau tadi mencatat sesuatu, cek dulu dengan /riwayat sebelum mengirim ulang, '
-                'supaya tidak tercatat dua kali.')
+                'Kalau tadi mencatat pengeluaran, cek dulu dengan /riwayat sebelum mengirim ulang, '
+                'supaya tidak tercatat dua kali. /todo aman dikirim ulang: acara, tugas, dan '
+                'penandanya tidak dibuat dobel.')
     return '⚠️ Error: ' + type(e).__name__ + ': ' + str(e)
 
 
