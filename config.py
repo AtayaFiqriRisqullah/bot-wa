@@ -13,3 +13,4 @@ PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID', '')
 APP_SECRET = os.environ.get('APP_SECRET', '')
 TUGAS_URL = 'https://script.google.com/macros/s/AKfycbyi19ZkKu6f40J8mqkzndurbkBNrqaODulpOXJpZjMcIpEtFl3PggAtTt-F2oFAULr3/exec'
 TUGAS_KUNCI = '12345'
+CATATAN_DOC_ID = '1DFHCt1NPUBjcsJukxQQO7inKHBgYujTYl2X70_wJv34'

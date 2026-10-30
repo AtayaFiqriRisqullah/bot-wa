@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta
 
 import requests
 
+from catatan import MAKS_CATATAN, CatatanGagal, ambil_entri, tambah_catatan
 from kalender import (GAGAL_KALENDER, TugasGagal, event_hari_ini, tambah_event,
                       tambah_penanda_deadline, tambah_tugas)
 from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBerubah,
@@ -1064,6 +1065,73 @@ def pengingat_pagi():
     return teks
 
 
+# ---------------------------------------------------------------------------
+# Catatan cepat ke Google Docs
+# ---------------------------------------------------------------------------
+
+CATATAN_BAWAAN = 5          # /catatan tanpa angka
+CATATAN_MAKS_TAMPIL = 15    # paling banyak catatan yang dikirim balik sekali jalan
+CATATAN_MAKS_PANJANG = 300  # catatan yang lebih panjang dipotong saat ditampilkan
+
+
+def format_daftar_catatan(judul, daftar):
+    baris = [judul]
+    for isi in daftar:
+        if len(isi) > CATATAN_MAKS_PANJANG:
+            isi = isi[:CATATAN_MAKS_PANJANG - 1].rstrip() + '…'
+        baris.append(isi)
+    return '\n\n'.join(baris)
+
+
+def perintah_catat(argumen):
+    """/catat <teks> (atau /ide <teks>) -> simpan ke Google Docs. Boleh beberapa baris."""
+    teks = argumen.strip()
+    if not teks:
+        return ('Format: /catat <catatan>\n'
+                'Contoh: /catat #game ide puzzle bentuk geometri\n'
+                'Boleh beberapa baris. Lihat lagi dengan /catatan atau /cari <kata>')
+    if len(teks) > MAKS_CATATAN:
+        return ('Catatannya terlalu panjang (' + str(len(teks)) + ' karakter, maksimal ' +
+                str(MAKS_CATATAN) + '). Belum ada yang disimpan.')
+    tambah_catatan(teks, sekarang())
+    baris_pertama = teks.splitlines()[0].strip()
+    ringkas = baris_pertama if len(baris_pertama) <= 80 else baris_pertama[:79].rstrip() + '…'
+    if len(teks.splitlines()) > 1:
+        ringkas += ' …'
+    return '📝 Tercatat: ' + ringkas
+
+
+def perintah_catatan(argumen):
+    """/catatan [jumlah] -> catatan terakhir (bawaan 5)."""
+    sisa = argumen.strip()
+    jumlah = CATATAN_BAWAAN
+    if sisa:
+        if not sisa.isdigit() or int(sisa) < 1:
+            return 'Format: /catatan [jumlah]\nContoh: /catatan 10'
+        jumlah = min(int(sisa), CATATAN_MAKS_TAMPIL)
+    entri = ambil_entri()
+    if not entri:
+        return 'Belum ada catatan di dokumen. Mulai dengan /catat <ide>'
+    terakhir = entri[-jumlah:]
+    return format_daftar_catatan(
+        '📝 Catatan terakhir (' + str(len(terakhir)) + ' dari ' + str(len(entri)) + ')', terakhir)
+
+
+def perintah_cari(argumen):
+    """/cari <kata> -> catatan yang memuat semua kata itu (huruf besar/kecil tidak dibedakan)."""
+    kata = argumen.lower().split()
+    if not kata:
+        return 'Format: /cari <kata>\nContoh: /cari puzzle   (beberapa kata harus muncul semuanya)'
+    cocok = [e for e in ambil_entri() if all(k in e.lower() for k in kata)]
+    if not cocok:
+        return 'Tidak ada catatan yang mengandung "' + ' '.join(kata) + '".'
+    tampil = cocok[-CATATAN_MAKS_TAMPIL:]
+    judul = '🔎 ' + str(len(cocok)) + ' catatan mengandung "' + ' '.join(kata) + '"'
+    if len(tampil) < len(cocok):
+        judul += ' (menampilkan ' + str(len(tampil)) + ' terbaru)'
+    return format_daftar_catatan(judul, tampil)
+
+
 def perintah_bantuan(argumen):
     pintasan = ', '.join(daftar_pintasan()) or 'belum ada'
     return ('Perintah:\n'
@@ -1080,6 +1148,9 @@ def perintah_bantuan(argumen):
             '/undo\n'
             '/deadline (tugas dan pengingatnya)\n'
             '/pagi (pesan pagi sekarang)\n'
+            '/catat (simpan ide ke Google Docs, alias /ide)\n'
+            '/catatan (catatan terakhir)\n'
+            '/cari (cari catatan)\n'
             '/todo')
 
 
@@ -1097,6 +1168,10 @@ PERINTAH = {
     '/undo': perintah_undo,
     '/deadline': perintah_deadline,
     '/pagi': perintah_pagi,
+    '/catat': perintah_catat,
+    '/ide': perintah_catat,
+    '/catatan': perintah_catatan,
+    '/cari': perintah_cari,
     '/todo': perintah_todo,
     '/bantuan': perintah_bantuan,
 }
@@ -1117,12 +1192,14 @@ def pesan_kesalahan(e):
                     '(baris 1, kolom A-C: tanggal, langkah, menit_layar).')
         return ('Tab bulan ' + nama + ' belum ada di spreadsheet. '
                 'Duplikat tab Template, lalu ganti namanya menjadi ' + nama + '.')
+    if isinstance(e, CatatanGagal):
+        return '⚠️ Catatan belum tersimpan: ' + str(e)
     traceback.print_exc()          # detail lengkap muncul di terminal Python
     if isinstance(e, GAGAL_JARINGAN + GAGAL_KALENDER):
         return ('📶 Koneksi ke Google terputus, padahal sudah dicoba ulang beberapa kali. '
                 'Kalau tadi mencatat pengeluaran, cek dulu dengan /riwayat sebelum mengirim ulang, '
                 'supaya tidak tercatat dua kali. /todo aman dikirim ulang: acara, tugas, dan '
-                'penandanya tidak dibuat dobel.')
+                'penandanya tidak dibuat dobel. Untuk /catat, lihat dokumennya dulu sebelum kirim ulang.')
     return '⚠️ Error: ' + type(e).__name__ + ': ' + str(e)
 
 
@@ -1157,7 +1234,7 @@ def jalankan_baris(baris, kategori_banyak=None):
     """Satu baris pesan -> teks balasan. Exception sengaja tidak ditangkap di sini.
     kategori_banyak (set) hanya diisi kalau pesannya terdiri dari beberapa baris."""
     if baris.startswith('/'):
-        perintah, _, argumen = baris.partition(' ')
+        perintah, argumen = (baris.split(None, 1) + [''])[:2]
         fungsi = PERINTAH.get(perintah.lower())
         if fungsi is None:
             return 'Perintah tidak dikenal. Coba: /bantuan'
