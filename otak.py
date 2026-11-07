@@ -14,7 +14,8 @@ from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBeruba
                          batalkan_terakhir, nama_bulan, pengingat_sudah_dicek,
                          sekarang, simpan_pemasukan, simpan_pemasukan_bank,
                          simpan_pengeluaran, simpan_riwayat, status_sudah,
-                         status_tandai, tandai_pengingat_dicek, tulis_pengaturan,
+                         status_tandai, tambah_pemasukan, tandai_pengingat_dicek,
+                         tulis_pengaturan,
                          ubah_deadline)
 
 # Kata kategori yang boleh diketik -> nama tabel di spreadsheet
@@ -227,8 +228,8 @@ def baca_pengeluaran_biasa(bagian, nama_perintah, daftar):
 
 def catat_pengeluaran(argumen, nama_perintah, lewat_qris, nominal_minimal=0):
     """Dipakai bersama oleh /out, /qris, dan pesan tanpa perintah.
-    Kalau lewat_qris True, selain mencatat pengeluaran, bot juga menambah satu
-    baris SUMBER_QRIS di tabel Pemasukan dengan nominal yang sama.
+    Kalau lewat_qris True, selain mencatat pengeluaran, bot juga menambahkan nominalnya
+    ke baris SUMBER_QRIS di tabel Pemasukan (satu baris per bulan, bukan satu per transaksi).
 
     Pengeluaran bisa untuk hari lain: tanggalnya ('kemarin' atau '22/10') ditulis paling
     depan, sebelum nominal atau nama pintasan.
@@ -267,13 +268,14 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris, nominal_minimal=0):
     # Pemasukan penuh, errornya muncul sebelum ada yang tertulis setengah-setengah.
     # "jejak" mencatat sel yang ditulis supaya bisa dibatalkan dengan /undo.
     jejak = []
-    baris_qris = None
+    baris_qris = total_qris = None
     ringkasan = ('QRIS ' if lewat_qris else '') + kategori + ' ' + nama + ' ' + rupiah(nominal)
     if tanggal:
         ringkasan += ' untuk ' + tanggal.strftime('%d/%m')
     try:
         if lewat_qris:
-            _, baris_qris = simpan_pemasukan(SUMBER_QRIS, nominal, jejak=jejak, tanggal=tanggal)
+            _, baris_qris, total_qris = tambah_pemasukan(SUMBER_QRIS, nominal, jejak=jejak,
+                                                         tanggal=tanggal)
         tab, baris = simpan_pengeluaran(kategori, nama, nominal, jejak=jejak, tanggal=tanggal)
     finally:
         if jejak:                           # tetap tercatat walau penulisan kedua gagal
@@ -283,8 +285,8 @@ def catat_pengeluaran(argumen, nama_perintah, lewat_qris, nominal_minimal=0):
              (' untuk ' + tanggal.strftime('%d/%m/%Y') if tanggal else '') +
              ' (tab ' + tab + ', baris ' + str(baris) + ')')
     if lewat_qris:
-        pesan += ('\n💳 ' + SUMBER_QRIS + ' ' + rupiah(nominal) +
-                  ' dicatat di Pemasukan (baris ' + str(baris_qris) + ')')
+        pesan += ('\n💳 ' + SUMBER_QRIS + ' +' + rupiah(nominal) + ' (total ' + rupiah(total_qris) +
+                  ', Pemasukan baris ' + str(baris_qris) + ')')
     if tanggal and (tanggal.year, tanggal.month) != (hari_ini.year, hari_ini.month):
         return pesan, None                  # bulan lain: sisa uang dan batas bulan ini tidak berubah
     return pesan, kategori

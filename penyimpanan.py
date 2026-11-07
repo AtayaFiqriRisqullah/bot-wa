@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 import threading
@@ -112,6 +113,21 @@ _kunci_status = threading.Lock()
 _kunci_pengaturan = threading.Lock()
 _kunci_deadline = threading.Lock()
 
+# Satu penulisan ke sheet pada satu waktu. Tanpa ini, dua pesan yang masuk hampir
+# bersamaan sama-sama membaca "baris kosong pertama" yang sama, lalu yang kedua menimpa
+# yang pertama dan catatan yang pertama hilang. RLock supaya fungsi bertanda kunci ini
+# boleh memanggil satu sama lain.
+_kunci_tulis = threading.RLock()
+
+
+def _satu_per_satu(fungsi):
+    """Dekorator: jalankan fungsi sambil memegang _kunci_tulis."""
+    @functools.wraps(fungsi)
+    def bungkus(*args, **kwargs):
+        with _kunci_tulis:
+            return fungsi(*args, **kwargs)
+    return bungkus
+
 
 class TabTidakAda(Exception):
     """Dilempar kalau ada tab yang tidak ditemukan di spreadsheet."""
@@ -174,6 +190,7 @@ def _catat_jejak(jejak, ws, rentang, nama, nominal):
                       'nama': str(nama), 'nominal': nominal})
 
 
+@_satu_per_satu
 def simpan_pengeluaran(kategori, nama, nominal, jejak=None, tanggal=None):
     """Tulis satu pengeluaran ke tabel kategori.
 
@@ -197,6 +214,7 @@ def simpan_pengeluaran(kategori, nama, nominal, jejak=None, tanggal=None):
     return ws.title, baris
 
 
+@_satu_per_satu
 def _tulis_ke_tabel(ws, kolom_awal, kolom_akhir, baris_awal, baris_akhir,
                     nama_tabel, nama, nominal, jejak, tanggal=None):
     """Isi baris kosong pertama di tabel (nama / tanggal / nominal).
@@ -225,6 +243,41 @@ def simpan_pemasukan(sumber, nominal, jejak=None, tanggal=None):
     baris = _tulis_ke_tabel(ws, 'B', 'D', PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR,
                             'Pemasukan', sumber, nominal, jejak, tanggal=tanggal)
     return ws.title, baris
+
+
+@_satu_per_satu
+def tambah_pemasukan(sumber, nominal, jejak=None, tanggal=None):
+    """Tambahkan `nominal` ke baris `sumber` di tabel Pemasukan (misalnya 'QRIS BNI').
+
+    Satu baris per sumber per bulan, jadi pembayaran QRIS yang banyak tidak menghabiskan
+    tabel. Kalau di tab itu belum ada baris untuk sumber tersebut, baris baru dibuat
+    (tanggalnya tanggal pencatatan pertama). Kalau ada beberapa baris dengan sumber yang
+    sama, yang paling atas yang ditambah.
+
+    `tanggal` (date) kosong berarti hari ini di tab bulan ini.
+    Mengembalikan (nama tab, nomor baris, total semua baris sumber itu di tab ini).
+    """
+    ws = _tab_untuk(tanggal)
+    isi = ws.get(f'B{PEMASUKAN_BARIS_AWAL}:D{PEMASUKAN_BARIS_AKHIR}',
+                 value_render_option='UNFORMATTED_VALUE')
+    cocok = []                                   # (nomor baris, nama di sel, nilai) sumber ini
+    for i, baris in enumerate(isi):
+        if (len(baris) >= 3 and str(baris[0]).strip().lower() == sumber.lower()
+                and _angka(baris[2])):
+            nilai = int(baris[2]) if float(baris[2]).is_integer() else baris[2]
+            cocok.append((PEMASUKAN_BARIS_AWAL + i, str(baris[0]).strip(), nilai))
+    if not cocok:
+        baris_baru = _tulis_ke_tabel(ws, 'B', 'D', PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR,
+                                     'Pemasukan', sumber, nominal, jejak, tanggal=tanggal)
+        return ws.title, baris_baru, nominal
+    nomor, nama_sel, lama = cocok[0]
+    baru = lama + nominal
+    ws.update(range_name=f'D{nomor}', values=[[baru]], raw=False)
+    if jejak is not None:
+        # 'sebelum' = nilai sebelum ditambah: /undo mengembalikan nilainya, bukan mengosongkan baris.
+        jejak.append({'tab': ws.title, 'rentang': f'B{nomor}:D{nomor}', 'nama': nama_sel,
+                      'nominal': baru, 'sebelum': lama, 'jenis': 'tambah'})
+    return ws.title, nomor, sum(n for _, _, n in cocok) + nominal
 
 
 def simpan_pemasukan_bank(bank, nominal, jejak=None):
@@ -480,6 +533,7 @@ def _sel_kosong(ws, tulisan):
     return not any(str(x).strip() for baris in sel for x in baris)
 
 
+@_satu_per_satu
 def batalkan_terakhir():
     """Kosongkan sel-sel dari catatan terakhir.
 
@@ -495,21 +549,26 @@ def batalkan_terakhir():
         entri = daftar[-1]
 
         # Cek semuanya dulu; hapus hanya kalau semua sel aman.
-        yang_dihapus = []
+        yang_dihapus = []                 # (ws, rentang, nilai sebelum ditambah atau None)
         aman = True
         for t in entri['tulisan']:
             ws = _tab(t['tab'])
             if _sel_kosong(ws, t):
                 continue                  # sudah dikosongkan manual
             if _sel_masih_sama(ws, t):
-                yang_dihapus.append((ws, t['rentang']))
+                yang_dihapus.append((ws, t['rentang'], t.get('sebelum')))
             else:
                 aman = False
                 break
 
         if aman:
-            for ws, rentang in yang_dihapus:
-                ws.batch_clear([rentang])     # hanya isi, format sel tetap
+            for ws, rentang, sebelum in yang_dihapus:
+                if sebelum is None:
+                    ws.batch_clear([rentang])     # hanya isi, format sel tetap
+                else:
+                    # catatan ini hanya menambah nilai di baris yang sudah ada (tambah_pemasukan):
+                    # kembalikan nilainya, jangan hapus barisnya.
+                    ws.update(range_name=rentang.split(':')[1], values=[[sebelum]], raw=False)
 
         _tulis_riwayat(daftar[:-1])           # keluarkan dari riwayat
         if not aman:
