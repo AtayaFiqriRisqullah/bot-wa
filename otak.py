@@ -58,6 +58,10 @@ RIWAYAT_TAMPIL = 5
 # Pengingat "belum catat pengeluaran": dikirim sekali sehari, mulai jam ini (WIB).
 JAM_PENGINGAT = 20
 
+# Rekap pengeluaran harian: dikirim sekali sehari, mulai jam ini (WIB).
+# /malam menampilkannya kapan saja.
+JAM_REKAP = 21
+
 # Peringatan batas bulanan mulai muncul saat pengeluaran satu kategori mencapai
 # sekian persen dari batasnya (lihat /batas).
 AMBANG_PERINGATAN = 0.8
@@ -1134,6 +1138,57 @@ def perintah_cari(argumen):
     return format_daftar_catatan(judul, tampil)
 
 
+def teks_bulan_ini():
+    """Total pengeluaran bulan ini per kategori; kategori yang punya batas (/batas)
+    ditampilkan beserta persentasenya. Melempar TabTidakAda kalau tabnya belum ada."""
+    tab = nama_bulan()
+    total = ambil_total_kategori(tab)
+    batas = baca_batas()
+    baris = ['📊 Bulan ini (' + tab + '): ' + rupiah(sum(total.values()))]
+    for kategori, nilai in total.items():
+        if nilai == 0 and kategori not in batas:
+            continue
+        teks = '• ' + kategori + ' ' + rupiah(nilai)
+        if batas.get(kategori):
+            teks += (' dari ' + rupiah(batas[kategori]) + ' (' +
+                     str(int(nilai * 100 / batas[kategori])) + '%)')
+            if nilai > batas[kategori]:
+                teks += ' 🚨 melewati batas'
+            elif nilai >= batas[kategori] * AMBANG_PERINGATAN:
+                teks += ' ⚠️'
+        baris.append(teks)
+    return '\n'.join(baris)
+
+
+def susun_rekap_harian():
+    """Rekap pengeluaran hari ini: rincian per kategori, total hari ini, posisi bulan ini
+    (beserta batasnya), dan sisa uang. Melempar TabTidakAda kalau tab bulannya belum ada."""
+    kini = sekarang()
+    daftar = ambil_pengeluaran_hari_ini()
+    bagian = ['🌙 Rekap pengeluaran ' + NAMA_HARI[kini.weekday()] + ', ' + str(kini.day) + ' ' +
+              BULAN[kini.month - 1] + ' ' + str(kini.year)]
+    if daftar:
+        per_kategori = {}
+        for kategori, nama, nilai in daftar:
+            per_kategori.setdefault(kategori, []).append((nama, nilai))
+        baris = []
+        for kategori, isi in per_kategori.items():
+            baris.append(kategori + ' (' + rupiah(sum(n for _, n in isi)) + ')')
+            baris += ['• ' + nama + ' ' + rupiah(nilai) for nama, nilai in isi]
+        baris.append('Total hari ini: ' + rupiah(sum(n for _, _, n in daftar)))
+        bagian.append('\n'.join(baris))
+    else:
+        bagian.append('Tidak ada pengeluaran yang tercatat hari ini.')
+    bagian.append(teks_bulan_ini())
+    bagian.append(teks_uang_pagi())
+    return '\n\n'.join(bagian)
+
+
+def perintah_malam(argumen):
+    """/malam -> rekap pengeluaran hari ini sekarang juga (tidak mempengaruhi pengiriman otomatis)."""
+    return susun_rekap_harian()
+
+
 def perintah_bantuan(argumen):
     pintasan = ', '.join(daftar_pintasan()) or 'belum ada'
     return ('Perintah:\n'
@@ -1150,6 +1205,7 @@ def perintah_bantuan(argumen):
             '/undo\n'
             '/deadline (tugas dan pengingatnya)\n'
             '/pagi (pesan pagi sekarang)\n'
+            '/malam (rekap hari ini sekarang)\n'
             '/catat (simpan ide ke Google Docs, alias /ide)\n'
             '/catatan (catatan terakhir)\n'
             '/cari (cari catatan)\n'
@@ -1170,6 +1226,7 @@ PERINTAH = {
     '/undo': perintah_undo,
     '/deadline': perintah_deadline,
     '/pagi': perintah_pagi,
+    '/malam': perintah_malam,
     '/catat': perintah_catat,
     '/ide': perintah_catat,
     '/catatan': perintah_catatan,
@@ -1327,14 +1384,36 @@ def pengingat_catat_pengeluaran():
             'Catat dengan /out atau /qris, atau abaikan kalau memang tidak ada.' + tambahan)
 
 
+def pengingat_rekap_harian():
+    """Untuk penjadwal: rekap pengeluaran harian, sekali sehari mulai JAM_REKAP.
+    Kalau pembacaan sheet gagal, hari itu tidak ditandai, jadi dicoba lagi menit berikutnya."""
+    waktu = sekarang()
+    if waktu.hour < JAM_REKAP:
+        return None
+    hari = waktu.strftime('%Y-%m-%d')
+    if status_sudah('rekap_harian', hari):
+        return None
+    try:
+        teks = susun_rekap_harian()
+    except TabTidakAda as e:
+        teks = ('🌙 Rekap hari ini belum bisa dibuat: tab bulan ' + str(e) +
+                ' belum ada di spreadsheet. Duplikat tab Template dulu.')
+    except Exception:
+        traceback.print_exc()
+        return None
+    status_tandai('rekap_harian', hari)
+    return teks
+
+
 def pengingat_berkala():
     """Pintu masuk untuk penjadwal: panggil tiap menit dan kirim hasilnya kalau bukan None.
 
-    Mengumpulkan semua pengingat yang jatuh tempo: pesan pagi, pengingat deadline, dan
+    Mengumpulkan semua pengingat yang jatuh tempo: pesan pagi, pengingat deadline, rekap harian, dan
     pengingat "belum catat pengeluaran". Tiap sumber dijaga sendiri-sendiri, jadi satu yang
     error tidak menghalangi yang lain."""
     pesan = []
-    for sumber in (pengingat_pagi, pengingat_deadline, pengingat_catat_pengeluaran):
+    for sumber in (pengingat_pagi, pengingat_deadline, pengingat_catat_pengeluaran,
+                   pengingat_rekap_harian):
         try:
             teks = sumber()
         except Exception:
