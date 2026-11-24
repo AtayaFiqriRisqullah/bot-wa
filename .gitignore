@@ -6,3 +6,10 @@ node_modules/
 auth_info/
 bot-baileys/node_modules/
 bot-baileys/auth_info/
+riwayat.json
+status.json
+deadline.json
+pengingat_cepat.json
+tagihan.json
+konfirmasi.json
+*.tmp

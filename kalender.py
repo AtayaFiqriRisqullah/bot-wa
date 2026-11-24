@@ -1,3 +1,4 @@
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -17,9 +18,22 @@ except ImportError:                # belum diisi di config.py: /todo tetap membu
     TUGAS_KUNCI = TUGAS_URL = None
 
 WIB = timezone(timedelta(hours=7))
-_cred = service_account.Credentials.from_service_account_info(
-    muat_kunci(), scopes=['https://www.googleapis.com/auth/calendar'])
-_layanan = build('calendar', 'v3', credentials=_cred)
+_kunci_layanan = threading.Lock()
+_layanan = None
+
+
+def _dapatkan_layanan():
+    """Buat klien Google Calendar saat pertama kali dibutuhkan (lazy init)."""
+    global _layanan
+    if _layanan is not None:
+        return _layanan
+    with _kunci_layanan:
+        if _layanan is None:
+            cred = service_account.Credentials.from_service_account_info(
+                muat_kunci(), scopes=['https://www.googleapis.com/auth/calendar'])
+            _layanan = build('calendar', 'v3', credentials=cred)
+        return _layanan
+
 
 # Gangguan jaringan sesaat (koneksi di-reset, SSL putus di tengah jalan, timeout, dsb.).
 # OSError mencakup ssl.SSLError, ConnectionError, dan timeout soket.
@@ -28,6 +42,8 @@ JEDA_ULANG = (1, 2, 4)    # detik menunggu sebelum percobaan ke-2, ke-3, dan ke-
 
 
 def _layak_diulang(e):
+    if isinstance(e, (FileNotFoundError, PermissionError)):
+        return False
     if isinstance(e, HttpError):               # error dari server Google: ulangi hanya kalau 5xx
         return e.resp.status in (500, 502, 503, 504)
     return True
@@ -38,7 +54,8 @@ def _coba(fungsi, sudah_masuk=None, cek_dulu=False):
 
     `sudah_masuk` dipakai untuk panggilan yang menulis: kalau koneksi putus setelah
     permintaan sampai ke Google, penulisan bisa saja sudah berhasil. Sebelum mengulang,
-    sudah_masuk() dicek dulu; kalau True, penulisan dianggap selesai (tidak dobel).
+    sudah_masuk() dicek dulu; kalau menghasilkan nilai truthy (True atau event_id),
+    penulisan dianggap selesai (tidak dobel).
     Dengan cek_dulu=True pengecekan itu dilakukan juga sebelum percobaan pertama, jadi
     perintah yang dikirim ulang pengguna tidak membuat acara kembar.
     """
@@ -46,8 +63,9 @@ def _coba(fungsi, sudah_masuk=None, cek_dulu=False):
         time.sleep(jeda)
         if sudah_masuk is not None and (percobaan > 0 or cek_dulu):
             try:
-                if sudah_masuk():
-                    return None
+                ada = sudah_masuk()
+                if ada:
+                    return ada
             except (HttpError,) + GAGAL_KALENDER:
                 pass                           # belum bisa memastikan; coba tulis lagi
         try:
@@ -59,38 +77,55 @@ def _coba(fungsi, sudah_masuk=None, cek_dulu=False):
                   str(JEDA_ULANG[percobaan]) + ' detik')
 
 
+def _cari_acara(judul, awal, akhir, cocok):
+    """Kembalikan id acara (atau None) jika di rentang [awal, akhir) sudah ada acara
+    berjudul `judul` yang waktu mulainya lolos fungsi cocok(start)."""
+    hasil = _dapatkan_layanan().events().list(
+        calendarId=CALENDAR_ID, timeMin=awal.isoformat(), timeMax=akhir.isoformat(),
+        q=judul, singleEvents=True, maxResults=20).execute()
+    for e in hasil.get('items', []):
+        if e.get('summary') == judul and cocok(e.get('start', {})):
+            return e.get('id') or True
+    return None
+
+
 def _ada_acara(judul, awal, akhir, cocok):
     """True kalau di rentang waktu [awal, akhir) sudah ada acara berjudul `judul` yang
     waktu mulainya lolos fungsi cocok(start)."""
-    hasil = _layanan.events().list(
-        calendarId=CALENDAR_ID, timeMin=awal.isoformat(), timeMax=akhir.isoformat(),
-        q=judul, singleEvents=True, maxResults=20).execute()
-    return any(e.get('summary') == judul and cocok(e.get('start', {}))
-               for e in hasil.get('items', []))
+    return bool(_cari_acara(judul, awal, akhir, cocok))
 
 
-def tambah_event(judul, mulai):
-    selesai = mulai + timedelta(hours=1)
+def tambah_event(judul, mulai, durasi_menit=60, warna_id=None, deskripsi=''):
+    """Buat acara kalender. Mengembalikan event_id (str) jika berhasil."""
+    selesai = mulai + timedelta(minutes=durasi_menit)
     isi = {
         'summary': judul,
         'start': {'dateTime': mulai.isoformat(), 'timeZone': 'Asia/Jakarta'},
         'end': {'dateTime': selesai.isoformat(), 'timeZone': 'Asia/Jakarta'},
     }
+    if warna_id:
+        isi['colorId'] = str(warna_id)
+    if deskripsi:
+        isi['description'] = deskripsi
 
     def sama_mulai(start):
         return bool(start.get('dateTime')) and datetime.fromisoformat(start['dateTime']) == mulai
 
-    _coba(lambda: _layanan.events().insert(calendarId=CALENDAR_ID, body=isi).execute(),
-          sudah_masuk=lambda: _ada_acara(judul, mulai - timedelta(minutes=1), selesai, sama_mulai),
-          cek_dulu=True)
+    hasil = _coba(
+        lambda: _dapatkan_layanan().events().insert(calendarId=CALENDAR_ID, body=isi).execute(),
+        sudah_masuk=lambda: _cari_acara(judul, mulai - timedelta(minutes=1), selesai, sama_mulai),
+        cek_dulu=True)
+    if isinstance(hasil, dict):
+        return hasil.get('id')
+    return hasil if isinstance(hasil, str) else None
 
 
-def tambah_penanda_deadline(judul, tanggal):
+def tambah_penanda_deadline(judul, tanggal, deskripsi=''):
     """Acara seharian berwarna merah berjudul "Due: judul" pada `tanggal` (date).
 
     Ini acara kalender biasa yang meniru tampilan deadline di Google Tasks. Isian
     Deadline yang asli tidak bisa dibuat lewat API, dan Calendar API tidak punya jenis
-    acara "tugas".
+    acara "tugas". Mengembalikan event_id (str) jika berhasil.
     """
     isi = {
         'summary': 'Due: ' + judul,
@@ -99,21 +134,42 @@ def tambah_penanda_deadline(judul, tanggal):
         'colorId': '11',                  # merah (Tomato)
         'transparency': 'transparent',    # tampil "free", tidak menandai waktu sibuk
     }
+    if deskripsi:
+        isi['description'] = deskripsi
     awal_hari = datetime(tanggal.year, tanggal.month, tanggal.day, tzinfo=WIB)
 
     def sama_tanggal(start):
         return start.get('date') == tanggal.isoformat()
 
-    _coba(lambda: _layanan.events().insert(calendarId=CALENDAR_ID, body=isi).execute(),
-          sudah_masuk=lambda: _ada_acara(isi['summary'], awal_hari,
-                                         awal_hari + timedelta(days=1), sama_tanggal),
-          cek_dulu=True)
+    hasil = _coba(
+        lambda: _dapatkan_layanan().events().insert(calendarId=CALENDAR_ID, body=isi).execute(),
+        sudah_masuk=lambda: _cari_acara(isi['summary'], awal_hari,
+                                        awal_hari + timedelta(days=1), sama_tanggal),
+        cek_dulu=True)
+    if isinstance(hasil, dict):
+        return hasil.get('id')
+    return hasil if isinstance(hasil, str) else None
+
+
+def hapus_event(event_id):
+    """Hapus satu acara Google Calendar berdasarkan ID-nya.
+    Jika acara sudah terhapus manual (HTTP 404/410), dianggap berhasil."""
+    if not event_id or not CALENDAR_ID:
+        return False
+    try:
+        _coba(lambda: _dapatkan_layanan().events().delete(
+            calendarId=CALENDAR_ID, eventId=event_id).execute())
+        return True
+    except HttpError as e:
+        if e.resp.status in (404, 410):
+            return True
+        raise
 
 
 def event_hari_ini():
     awal = datetime.now(WIB).replace(hour=0, minute=0, second=0, microsecond=0)
     akhir = awal + timedelta(days=1)
-    hasil = _coba(lambda: _layanan.events().list(
+    hasil = _coba(lambda: _dapatkan_layanan().events().list(
         calendarId=CALENDAR_ID, timeMin=awal.isoformat(), timeMax=akhir.isoformat(),
         singleEvents=True, orderBy='startTime').execute())
     daftar = []

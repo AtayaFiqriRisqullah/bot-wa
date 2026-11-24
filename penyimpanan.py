@@ -30,12 +30,12 @@ KATEGORI = {
     'Hiburan': ('P', 'R'),
 }
 BARIS_AWAL = 36     # baris data pertama tabel pengeluaran (baris 35 = TOTAL)
-BARIS_AKHIR = 500   # batas bawah saat membaca data
+BARIS_AKHIR = 1000  # batas bawah saat membaca data (sesuai rumus SUM D36:D1000 di sheet)
 BARIS_TOTAL = BARIS_AWAL - 1   # baris TOTAL tiap tabel pengeluaran, dibaca oleh /rekap
 
 # Tabel Pemasukan (kolom B-D: Source/Date/Nilai).
 PEMASUKAN_BARIS_AWAL = 10    # baris 9 = "Sisa Bulanan", jangan ditimpa
-PEMASUKAN_BARIS_AKHIR = 31   # batas rumus saldo BNI (B10:B31)
+PEMASUKAN_BARIS_AKHIR = 31   # batas rumus saldo BNI & Mandiri (B10:B31)
 
 # Tabel Pemasukan Bank (kolom T-V: Source/Date/Nilai).
 PEMASUKAN_BANK_BARIS_AWAL = 10
@@ -48,18 +48,28 @@ RENTANG_SALDO_BANK = 'K9:L12'    # Total, BNI, Mandiri
 
 # Riwayat catatan untuk /undo. Disimpan di file supaya tetap ada
 # walaupun bot dimatikan, dan hanya menyimpan RIWAYAT_MAKS catatan terakhir.
-RIWAYAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'riwayat.json')
+_DIREKTORI = os.path.dirname(os.path.abspath(__file__))
+RIWAYAT_FILE = os.path.join(_DIREKTORI, 'riwayat.json')
 RIWAYAT_MAKS = 20
 
 # Status kecil yang harus selamat dari restart bot. Sekarang isinya tanggal terakhir
 # pengingat "belum catat pengeluaran" dicek, supaya tidak terkirim dua kali sehari.
-STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status.json')
+STATUS_FILE = os.path.join(_DIREKTORI, 'status.json')
 
 # Pengaturan yang diubah lewat chat (daftar pintasan dan batas bulanan per kategori).
-PENGATURAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pengaturan.json')
+PENGATURAN_FILE = os.path.join(_DIREKTORI, 'pengaturan.json')
 
 # Daftar /deadline beserta tingkat pengingat yang sudah terkirim untuk masing-masing.
-DEADLINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deadline.json')
+DEADLINE_FILE = os.path.join(_DIREKTORI, 'deadline.json')
+
+# Daftar pengingat cepat sekali jalan (/ingatkan).
+PENGINGAT_CEPAT_FILE = os.path.join(_DIREKTORI, 'pengingat_cepat.json')
+
+# Daftar tagihan / pengeluaran rutin bulanan (/tagihan).
+TAGIHAN_FILE = os.path.join(_DIREKTORI, 'tagihan.json')
+
+# Draft menunggu konfirmasi (hasil scan struk foto atau transkrip voice note).
+KONFIRMASI_FILE = os.path.join(_DIREKTORI, 'konfirmasi.json')
 
 # Gangguan jaringan sesaat: koneksi di-reset, sinyal HP pindah, timeout, dan sejenisnya.
 # Panggilan ke Google yang gagal karena ini aman diulang, sebab semua panggilan di file
@@ -106,12 +116,29 @@ class _WsAman:
         return panggil
 
 
-_akun = gspread.service_account_from_dict(muat_kunci())
-_buku = _coba(_akun.open_by_key, SHEET_ID)
+_kunci_buku = threading.Lock()
+_akun = None
+_buku = None
 _kunci_riwayat = threading.Lock()
 _kunci_status = threading.Lock()
 _kunci_pengaturan = threading.Lock()
 _kunci_deadline = threading.Lock()
+_kunci_pengingat_cepat = threading.Lock()
+_kunci_tagihan = threading.Lock()
+_kunci_konfirmasi = threading.Lock()
+
+
+def _dapatkan_buku():
+    """Buka koneksi Google Sheets saat pertama kali dibutuhkan (lazy init)."""
+    global _akun, _buku
+    if _buku is not None:
+        return _buku
+    with _kunci_buku:
+        if _buku is None:
+            _akun = gspread.service_account_from_dict(muat_kunci())
+            _buku = _coba(_akun.open_by_key, SHEET_ID)
+        return _buku
+
 
 # Satu penulisan ke sheet pada satu waktu. Tanpa ini, dua pesan yang masuk hampir
 # bersamaan sama-sama membaca "baris kosong pertama" yang sama, lalu yang kedua menimpa
@@ -154,7 +181,7 @@ def _tanggal(tanggal=None):
 
 def _tab(nama):
     try:
-        return _WsAman(_coba(_buku.worksheet, nama))
+        return _WsAman(_coba(_dapatkan_buku().worksheet, nama))
     except WorksheetNotFound:
         raise TabTidakAda(nama)
 
@@ -214,23 +241,44 @@ def simpan_pengeluaran(kategori, nama, nominal, jejak=None, tanggal=None):
     return ws.title, baris
 
 
+def _cari_baris_kosong_tabel(ws, kolom_awal, baris_awal, baris_akhir, jumlah=1, nama_tabel='Pemasukan'):
+    """Cari `jumlah` baris kosong pertama di rentang [baris_awal, baris_akhir].
+    Melempar TabelPenuh(nama_tabel) kalau baris kosong tidak cukup."""
+    nomor_kolom = a1_to_rowcol(kolom_awal + '1')[1]
+    isi = ws.col_values(nomor_kolom)      # indeks 0 = baris 1; sel kosong = ''
+    kosong = []
+    for baris in range(baris_awal, baris_akhir + 1):
+        if baris > len(isi) or isi[baris - 1].strip() == '':
+            kosong.append(baris)
+            if len(kosong) == jumlah:
+                return kosong
+    raise TabelPenuh(nama_tabel)
+
+
+def _aman_teks_sel(nama):
+    if nama and nama[0] in '=+-@':
+        return "'" + nama                 # cegah teks dibaca sebagai rumus di Google Sheets
+    return nama
+
+
+@_satu_per_satu
+def _tulis_baris_tabel(ws, kolom_awal, kolom_akhir, baris, nama, nominal, jejak, tanggal=None):
+    rentang = f'{kolom_awal}{baris}:{kolom_akhir}{baris}'
+    ws.update(range_name=rentang,
+              values=[[_aman_teks_sel(nama), _tanggal(tanggal), nominal]], raw=False)
+    _catat_jejak(jejak, ws, rentang, nama, nominal)
+    return baris
+
+
 @_satu_per_satu
 def _tulis_ke_tabel(ws, kolom_awal, kolom_akhir, baris_awal, baris_akhir,
                     nama_tabel, nama, nominal, jejak, tanggal=None):
     """Isi baris kosong pertama di tabel (nama / tanggal / nominal).
     `tanggal` (date) kosong berarti hari ini."""
-    nomor_kolom = a1_to_rowcol(kolom_awal + '1')[1]
-    isi = ws.col_values(nomor_kolom)      # indeks 0 = baris 1; sel kosong = ''
-    for baris in range(baris_awal, baris_akhir + 1):
-        if baris > len(isi) or isi[baris - 1].strip() == '':
-            break
-    else:
-        raise TabelPenuh(nama_tabel)
-    rentang = f'{kolom_awal}{baris}:{kolom_akhir}{baris}'
-    ws.update(range_name=rentang,
-              values=[[nama, _tanggal(tanggal), nominal]], raw=False)
-    _catat_jejak(jejak, ws, rentang, nama, nominal)
-    return baris
+    baris = _cari_baris_kosong_tabel(ws, kolom_awal, baris_awal, baris_akhir,
+                                     jumlah=1, nama_tabel=nama_tabel)[0]
+    return _tulis_baris_tabel(ws, kolom_awal, kolom_akhir, baris, nama, nominal,
+                              jejak, tanggal=tanggal)
 
 
 def simpan_pemasukan(sumber, nominal, jejak=None, tanggal=None):
@@ -280,15 +328,72 @@ def tambah_pemasukan(sumber, nominal, jejak=None, tanggal=None):
     return ws.title, nomor, sum(n for _, _, n in cocok) + nominal
 
 
-def simpan_pemasukan_bank(bank, nominal, jejak=None):
-    """Tulis satu baris ke tabel Pemasukan Bank (T-V), misalnya bank='BNI'.
+def simpan_pemasukan_bank(bank, nominal, jejak=None, tanggal=None):
+    """Tulis satu baris ke tabel Pemasukan Bank (T-V), misalnya bank='BNI' atau 'BNI - gaji'.
+    `tanggal` (date) kosong berarti hari ini di tab bulan ini.
 
     Mengembalikan (nama tab, nomor baris).
     """
-    ws = _tab_bulan()
+    ws = _tab_untuk(tanggal)
     baris = _tulis_ke_tabel(ws, 'T', 'V', PEMASUKAN_BANK_BARIS_AWAL, PEMASUKAN_BANK_BARIS_AKHIR,
-                            'Pemasukan Bank', bank, nominal, jejak)
+                            'Pemasukan Bank', bank, nominal, jejak, tanggal=tanggal)
     return ws.title, baris
+
+
+@_satu_per_satu
+def simpan_transfer(asal, tujuan, nominal, catatan='', jejak=None, tanggal=None):
+    """Catat transfer antar dompet ('BNI', 'Mandiri', 'Tunai') sesuai rumus Monthly_Budget:
+    - BNI/Mandiri -> Tunai : 1 baris 'Tarik Uang <Bank>' (+nominal) di Pemasukan (B-D).
+    - Tunai -> BNI/Mandiri : 1 baris 'Setor Tunai' (-nominal) di Pemasukan (B-D) dan
+                             1 baris '<Bank> (setor tunai)' (+nominal) di Pemasukan Bank (T-V).
+    - BNI <-> Mandiri      : 2 baris di Pemasukan Bank (T-V):
+                             '<Asal> (tf keluar)' (-nominal) dan '<Tujuan> (tf masuk)' (+nominal).
+
+    Kapasitas baris dicek lebih dulu supaya tidak pernah tertulis setengah.
+    Mengembalikan (nama tab, daftar_baris), dengan tiap item (nama_tabel, nomor_baris, label, nilai).
+    """
+    ws = _tab_untuk(tanggal)
+    ekstra = (' - ' + catatan.strip()) if catatan and catatan.strip() else ''
+
+    if asal in ('BNI', 'Mandiri') and tujuan == 'Tunai':
+        label = 'Tarik Uang ' + asal + ekstra
+        baris = _cari_baris_kosong_tabel(ws, 'B', PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR,
+                                         jumlah=1, nama_tabel='Pemasukan')[0]
+        _tulis_baris_tabel(ws, 'B', 'D', baris, label, nominal, jejak, tanggal=tanggal)
+        return ws.title, [('Pemasukan', baris, label, nominal)]
+
+    if asal == 'Tunai' and tujuan in ('BNI', 'Mandiri'):
+        # Pastikan kedua tabel masih punya ruang sebelum menulis baris pertama.
+        baris_tunai = _cari_baris_kosong_tabel(
+            ws, 'B', PEMASUKAN_BARIS_AWAL, PEMASUKAN_BARIS_AKHIR,
+            jumlah=1, nama_tabel='Pemasukan')[0]
+        baris_bank = _cari_baris_kosong_tabel(
+            ws, 'T', PEMASUKAN_BANK_BARIS_AWAL, PEMASUKAN_BANK_BARIS_AKHIR,
+            jumlah=1, nama_tabel='Pemasukan Bank')[0]
+        label_tunai = 'Setor Tunai' + ekstra
+        label_bank = tujuan + ' (setor tunai' + ekstra + ')'
+        _tulis_baris_tabel(ws, 'B', 'D', baris_tunai, label_tunai, -nominal, jejak, tanggal=tanggal)
+        _tulis_baris_tabel(ws, 'T', 'V', baris_bank, label_bank, nominal, jejak, tanggal=tanggal)
+        return ws.title, [
+            ('Pemasukan', baris_tunai, label_tunai, -nominal),
+            ('Pemasukan Bank', baris_bank, label_bank, nominal),
+        ]
+
+    if asal in ('BNI', 'Mandiri') and tujuan in ('BNI', 'Mandiri') and asal != tujuan:
+        # Pastikan Pemasukan Bank punya minimal 2 baris kosong sekaligus.
+        baris_keluar, baris_masuk = _cari_baris_kosong_tabel(
+            ws, 'T', PEMASUKAN_BANK_BARIS_AWAL, PEMASUKAN_BANK_BARIS_AKHIR,
+            jumlah=2, nama_tabel='Pemasukan Bank')
+        label_keluar = asal + ' (tf keluar' + ekstra + ')'
+        label_masuk = tujuan + ' (tf masuk' + ekstra + ')'
+        _tulis_baris_tabel(ws, 'T', 'V', baris_keluar, label_keluar, -nominal, jejak, tanggal=tanggal)
+        _tulis_baris_tabel(ws, 'T', 'V', baris_masuk, label_masuk, nominal, jejak, tanggal=tanggal)
+        return ws.title, [
+            ('Pemasukan Bank', baris_keluar, label_keluar, -nominal),
+            ('Pemasukan Bank', baris_masuk, label_masuk, nominal),
+        ]
+
+    raise ValueError('Pasangan dompet transfer tidak valid: ' + str(asal) + ' -> ' + str(tujuan))
 
 
 def ambil_saldo():
@@ -332,23 +437,33 @@ def _tanggal_dari_sel(sel):
     return None
 
 
-def ambil_pengeluaran_hari_ini():
-    """Daftar (kategori, nama barang, nilai) untuk hari ini dari semua tabel."""
-    ws = _tab_bulan()
+def ambil_semua_pengeluaran(nama_tab=None):
+    """Daftar semua pengeluaran di tab `nama_tab` (atau tab bulan ini jika None):
+    [(kategori, nama barang, tanggal_date_atau_None, nilai_int, nomor_baris), ...]."""
+    ws = _tab_bulan() if nama_tab is None else _tab(nama_tab)
     rentang = [f'{a}{BARIS_AWAL}:{b}{BARIS_AKHIR}' for a, b in KATEGORI.values()]
     hasil = ws.batch_get(rentang, value_render_option='UNFORMATTED_VALUE')
-    hari_ini = sekarang().date()
     daftar = []
     for kategori, blok in zip(KATEGORI, hasil):
-        for baris in blok:
+        for indeks, baris in enumerate(blok):
             nama, tgl, nilai = (list(baris) + ['', '', ''])[:3]
-            if _tanggal_dari_sel(tgl) != hari_ini:
-                continue      # baris kosong, bukan hari ini, atau bukan tanggal
+            nama_str = str(nama).strip()
+            if not nama_str and not _angka(nilai):
+                continue
             try:
-                daftar.append((kategori, str(nama), int(float(nilai))))
+                nilai_int = int(round(float(nilai)))
             except (TypeError, ValueError):
                 continue
+            daftar.append((kategori, nama_str, _tanggal_dari_sel(tgl), nilai_int, BARIS_AWAL + indeks))
     return daftar
+
+
+def ambil_pengeluaran_hari_ini():
+    """Daftar (kategori, nama barang, nilai) untuk hari ini dari semua tabel."""
+    hari_ini = sekarang().date()
+    return [(kategori, nama, nilai)
+            for kategori, nama, tgl, nilai, _ in ambil_semua_pengeluaran()
+            if tgl == hari_ini]
 
 
 def nama_bulan(mundur=0):
@@ -394,6 +509,13 @@ def _baca_json(path):
         return {}
 
 
+def _tulis_json_atomik(path, data):
+    sementara = path + '.tmp'
+    with open(sementara, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(sementara, path)
+
+
 def _baca_status():
     return _baca_json(STATUS_FILE)
 
@@ -408,8 +530,7 @@ def tandai_pengingat_dicek(tanggal):
     with _kunci_status:
         status = _baca_status()
         status['pengingat_pengeluaran'] = tanggal
-        with open(STATUS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(status, f, ensure_ascii=False, indent=1)
+        _tulis_json_atomik(STATUS_FILE, status)
 
 
 def status_sudah(kunci, tanggal):
@@ -422,17 +543,29 @@ def status_tandai(kunci, tanggal):
     with _kunci_status:
         status = _baca_status()
         status[kunci] = tanggal
-        with open(STATUS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(status, f, ensure_ascii=False, indent=1)
+        _tulis_json_atomik(STATUS_FILE, status)
 
 
 # ---------------------------------------------------------------------------
-# Daftar deadline
+# Daftar deadline, pengingat cepat, dan tagihan rutin
 # ---------------------------------------------------------------------------
+
+def _ubah_daftar_json(path, kunci_lock, ubah):
+    with kunci_lock:
+        data = _baca_json(path)
+        daftar = data.get('daftar', [])
+        sebelum = json.dumps(daftar, ensure_ascii=False, sort_keys=True)
+        hasil = ubah(daftar)
+        if json.dumps(daftar, ensure_ascii=False, sort_keys=True) != sebelum:
+            data['daftar'] = daftar
+            _tulis_json_atomik(path, data)
+        return hasil
+
 
 def baca_deadline():
     """Daftar deadline: [{'judul': ..., 'waktu': '2026-10-30T23:59:00+07:00',
-    'terkirim': ['h3']}, ...]. Hanya untuk dibaca; ubah lewat ubah_deadline."""
+    'terkirim': ['h3'], 'calendar_event_ids': [...]}, ...]. Hanya untuk dibaca;
+    ubah lewat ubah_deadline."""
     with _kunci_deadline:
         return list(_baca_json(DEADLINE_FILE).get('daftar', []))
 
@@ -441,18 +574,56 @@ def ubah_deadline(ubah):
     """Baca daftar deadline, jalankan ubah(daftar) (boleh mengubah daftar di tempat),
     lalu simpan kalau isinya berubah. Mengembalikan apa yang dikembalikan ubah().
     Ditulis ke file sementara dulu lalu ditukar, supaya file tidak rusak kalau bot mati."""
-    with _kunci_deadline:
-        data = _baca_json(DEADLINE_FILE)
-        daftar = data.get('daftar', [])
-        sebelum = json.dumps(daftar, ensure_ascii=False, sort_keys=True)
-        hasil = ubah(daftar)
-        if json.dumps(daftar, ensure_ascii=False, sort_keys=True) != sebelum:
-            data['daftar'] = daftar
-            sementara = DEADLINE_FILE + '.tmp'
-            with open(sementara, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-            os.replace(sementara, DEADLINE_FILE)
-        return hasil
+    return _ubah_daftar_json(DEADLINE_FILE, _kunci_deadline, ubah)
+
+
+def baca_pengingat_cepat():
+    """Daftar pengingat cepat: [{'pesan': ..., 'waktu': '2026-10-30T21:00:00+07:00'}, ...]."""
+    with _kunci_pengingat_cepat:
+        return list(_baca_json(PENGINGAT_CEPAT_FILE).get('daftar', []))
+
+
+def ubah_pengingat_cepat(ubah):
+    """Ubah daftar pengingat cepat secara atomik."""
+    return _ubah_daftar_json(PENGINGAT_CEPAT_FILE, _kunci_pengingat_cepat, ubah)
+
+
+def baca_tagihan():
+    """Daftar tagihan / pengeluaran rutin bulanan."""
+    with _kunci_tagihan:
+        return list(_baca_json(TAGIHAN_FILE).get('daftar', []))
+
+
+def ubah_tagihan(ubah):
+    """Ubah daftar tagihan rutin secara atomik."""
+    return _ubah_daftar_json(TAGIHAN_FILE, _kunci_tagihan, ubah)
+
+
+# ---------------------------------------------------------------------------
+# Draft menunggu konfirmasi (scan struk / voice note)
+# ---------------------------------------------------------------------------
+
+def ambil_konfirmasi(pengirim):
+    """Baca draft konfirmasi milik `pengirim`, atau None kalau tidak ada."""
+    with _kunci_konfirmasi:
+        return _baca_json(KONFIRMASI_FILE).get(str(pengirim))
+
+
+def simpan_konfirmasi(pengirim, draft):
+    """Simpan draft konfirmasi milik `pengirim` secara atomik."""
+    with _kunci_konfirmasi:
+        data = _baca_json(KONFIRMASI_FILE)
+        data[str(pengirim)] = draft
+        _tulis_json_atomik(KONFIRMASI_FILE, data)
+
+
+def hapus_konfirmasi(pengirim):
+    """Hapus draft konfirmasi milik `pengirim` jika ada."""
+    with _kunci_konfirmasi:
+        data = _baca_json(KONFIRMASI_FILE)
+        if str(pengirim) in data:
+            del data[str(pengirim)]
+            _tulis_json_atomik(KONFIRMASI_FILE, data)
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +643,7 @@ def tulis_pengaturan(kunci, nilai):
     with _kunci_pengaturan:
         data = _baca_json(PENGATURAN_FILE)
         data[kunci] = nilai
-        sementara = PENGATURAN_FILE + '.tmp'
-        with open(sementara, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        os.replace(sementara, PENGATURAN_FILE)
+        _tulis_json_atomik(PENGATURAN_FILE, data)
 
 
 # ---------------------------------------------------------------------------

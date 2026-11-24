@@ -9,6 +9,7 @@ Dokumennya harus dibagikan ke akun layanan bot sebagai Editor, dan Google Docs A
 harus aktif di proyek Google Cloud yang sama dengan Sheets dan Calendar.
 """
 import re
+import threading
 import time
 
 import httplib2
@@ -27,9 +28,22 @@ except ImportError:                # belum diisi di config.py
 MAKS_CATATAN = 5000                # karakter per catatan
 POLA_ENTRI = re.compile(r'^\d{2}/\d{2}/\d{4} \d{2}:\d{2} — ')
 
-_cred = service_account.Credentials.from_service_account_info(
-    muat_kunci(), scopes=['https://www.googleapis.com/auth/documents'])
-_layanan = build('docs', 'v1', credentials=_cred)
+_kunci_layanan = threading.Lock()
+_layanan = None
+
+
+def _dapatkan_layanan():
+    """Buat klien Google Docs saat pertama kali dibutuhkan (lazy init)."""
+    global _layanan
+    if _layanan is not None:
+        return _layanan
+    with _kunci_layanan:
+        if _layanan is None:
+            cred = service_account.Credentials.from_service_account_info(
+                muat_kunci(), scopes=['https://www.googleapis.com/auth/documents'])
+            _layanan = build('docs', 'v1', credentials=cred)
+        return _layanan
+
 
 # Gangguan jaringan sesaat (koneksi di-reset, SSL putus di tengah jalan, timeout, dsb.).
 GAGAL_CATATAN = (OSError, httplib2.HttpLib2Error, TransportError)
@@ -41,6 +55,8 @@ class CatatanGagal(Exception):
 
 
 def _layak_diulang(e):
+    if isinstance(e, (FileNotFoundError, PermissionError)):
+        return False
     if isinstance(e, HttpError):               # error dari server Google: ulangi hanya kalau 5xx
         return e.resp.status in (500, 502, 503, 504)
     return True
@@ -100,7 +116,7 @@ def _panggil(fungsi, sudah_masuk=None):
 
 def _baca_paragraf():
     """Teks tiap paragraf dokumen, berurutan (tanpa karakter baris baru di ujung)."""
-    dokumen = _layanan.documents().get(
+    dokumen = _dapatkan_layanan().documents().get(
         documentId=CATATAN_DOC_ID,
         fields='body(content(paragraph(elements(textRun(content)))))').execute()
     hasil = []
@@ -132,7 +148,7 @@ def tambah_catatan(teks, waktu):
         ekor = paragraf[-(len(blok) + 3):]
         return any(ekor[i:i + len(blok)] == blok for i in range(len(ekor) - len(blok) + 1))
 
-    _panggil(lambda: _layanan.documents().batchUpdate(
+    _panggil(lambda: _dapatkan_layanan().documents().batchUpdate(
         documentId=CATATAN_DOC_ID, body=isi).execute(), sudah_masuk)
 
 
