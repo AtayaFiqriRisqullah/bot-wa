@@ -9,6 +9,7 @@ Semua panggilan HTTP memakai `requests` standar tanpa SDK tambahan.
 import base64
 import json
 import re
+import time
 from datetime import date
 
 try:
@@ -449,8 +450,9 @@ def _ekstrak_json(teks):
     return json.loads(teks)
 
 
-_GEMINI_MODEL_CADANGAN = ('gemini-3.8-flash', 'gemini-3.5-flash-lite')
-_gemini_pengganti = {}   # model_lama -> model_aktif hasil fallback 404
+_GEMINI_MODEL_CADANGAN = ('gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash')
+_GEMINI_STATUS_SEMENTARA = (429, 500, 502, 503, 504)
+_gemini_pengganti = {}   # model_lama -> model_aktif hasil fallback permanen (404)
 
 
 def _kandidat_model_gemini():
@@ -479,22 +481,50 @@ def _panggil_gemini(parts, minta_json=False, timeout=45):
     headers = {'x-goog-api-key': config.GEMINI_API_KEY}
 
     model_asal, kandidat = _kandidat_model_gemini()
+    batas_waktu = time.monotonic() + timeout
+    utama_404 = False
     r = None
+    galat_jaringan = None
+
     for idx, model in enumerate(kandidat):
+        sisa = batas_waktu - time.monotonic()
+        if idx > 0 and sisa < 3:
+            break
+        masih_ada_cadangan = idx + 1 < len(kandidat)
+        timeout_coba = min(sisa, max(12, timeout / 2)) if masih_ada_cadangan else sisa
         url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
                f'{model}:generateContent')
         try:
-            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            r = requests.post(url, headers=headers, json=body, timeout=max(5, timeout_coba))
+            galat_jaringan = None
         except requests.exceptions.RequestException as e:
+            galat_jaringan = e
+            if masih_ada_cadangan:
+                print(f'[ai] Model {model} gagal jaringan ({type(e).__name__}), mencoba {kandidat[idx + 1]}')
+                continue
             raise InputAIGagal(f'Gagal menghubungi Gemini API ({type(e).__name__})') from e
-        if r.status_code == 404 and idx + 1 < len(kandidat):
+
+        if r.status_code == 404 and masih_ada_cadangan:
+            if idx == 0:
+                utama_404 = True
             print(f'[ai] Model {model} tidak tersedia (404), mencoba {kandidat[idx + 1]}')
             continue
-        if r.status_code == 200 and model != model_asal:
+        if r.status_code in _GEMINI_STATUS_SEMENTARA and masih_ada_cadangan:
+            print(f'[ai] Model {model} sibuk/error ({r.status_code}), mencoba {kandidat[idx + 1]}')
+            continue
+        if r.status_code == 200 and utama_404 and model != model_asal:
             _gemini_pengganti[model_asal] = model
         break
 
+    if r is None:
+        raise InputAIGagal(f'Gagal menghubungi Gemini API ({type(galat_jaringan).__name__})')
+
     if r.status_code != 200:
+        if r.status_code in (429, 503):
+            raise InputAIGagal(
+                f'Server Gemini sedang sibuk ({r.status_code}), sudah dicoba beberapa model. '
+                'Coba kirim ulang sebentar lagi.'
+            )
         detail = ''
         try:
             detail = r.json().get('error', {}).get('message', '')

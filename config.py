@@ -25,7 +25,7 @@ APP_SECRET = os.environ.get('APP_SECRET', '')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
 GEMINI_MODEL = (
     os.environ.get('GEMINI_MODEL', '').strip().lstrip('/').removeprefix('models/').strip('/')
-    or 'gemini-3.8-flash'
+    or 'gemini-3.5-flash-lite'
 )
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '').strip()
 OPENAI_MODEL = os.environ.get('OPENAI_MODEL', '').strip() or 'gpt-4o-mini'
