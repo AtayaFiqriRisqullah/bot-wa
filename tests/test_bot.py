@@ -664,6 +664,121 @@ class TestBotWA(unittest.TestCase):
         self.assertIn('Mingguan&Bulanan: isi bensin Rp20.000', res_ok['teks'])
         self.assertIn('QRIS BNI', res_ok['teks'])
 
+    def test_gemini_model_default_fallback_404_dan_edge_case(self):
+        class RespPalsu:
+            def __init__(self, status_code, payload=None, text=''):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = text
+
+            def json(self):
+                if isinstance(self._payload, Exception):
+                    raise self._payload
+                return self._payload
+
+        # 1. Default model bukan gemini-2.5-flash lagi
+        self.assertEqual(config.GEMINI_MODEL, 'gemini-3.8-flash')
+
+        # 2. Fallback otomatis 404 saat .env masih pakai gemini-2.5-flash + cache di panggilan ke-2
+        panggilan = []
+
+        def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
+            panggilan.append((url, headers, json, kwargs))
+            if 'gemini-2.5-flash' in url:
+                return RespPalsu(404, {'error': {'message': 'no longer available to new users'}})
+            return RespPalsu(200, {
+                'candidates': [{
+                    'content': {
+                        'parts': [
+                            {'thought': True, 'text': 'internal thinking...'},
+                            {'text': '{"ok": true}'},
+                        ]
+                    }
+                }]
+            })
+
+        ai_input._gemini_pengganti.clear()
+        with patch.object(config, 'GEMINI_API_KEY', 'test-key-123'), \
+             patch.object(config, 'GEMINI_MODEL', 'gemini-2.5-flash'), \
+             patch.object(ai_input.requests, 'post', side_effect=fake_post):
+            hasil1 = ai_input._panggil_gemini([{'text': 'tes'}], minta_json=True)
+            self.assertEqual(hasil1, '{"ok": true}')
+            # Panggilan pertama: 404 ke 2.5-flash -> fallback ke 3.8-flash
+            self.assertEqual(len(panggilan), 2)
+            self.assertIn('/models/gemini-3.8-flash:generateContent', panggilan[1][0])
+            # API key dikirim lewat header, bukan query string; tanpa parameter temperature
+            self.assertEqual(panggilan[1][1], {'x-goog-api-key': 'test-key-123'})
+            self.assertNotIn('params', panggilan[1][3])
+            self.assertNotIn('temperature', panggilan[1][2].get('generationConfig', {}))
+            self.assertEqual(panggilan[1][2]['generationConfig'], {'responseMimeType': 'application/json'})
+
+            # Panggilan kedua langsung ke gemini-3.8-flash (cached, tidak 404 lagi)
+            hasil2 = ai_input._panggil_gemini([{'text': 'tes2'}], minta_json=False)
+            self.assertEqual(hasil2, '{"ok": true}')
+            self.assertEqual(len(panggilan), 3)
+            self.assertIn('/models/gemini-3.8-flash:generateContent', panggilan[2][0])
+            self.assertNotIn('generationConfig', panggilan[2][2])
+
+        # 3. Normalisasi prefix 'models/', '/models/.../', bare 'models/', dan kosong
+        ai_input._gemini_pengganti.clear()
+        for nilai_env, harapan in (
+            ('models/gemini-3.8-flash', 'gemini-3.8-flash'),
+            ('/models/gemini-3.5-flash-lite/', 'gemini-3.5-flash-lite'),
+            ('models/', 'gemini-3.8-flash'),
+            ('   ', 'gemini-3.8-flash'),
+        ):
+            with patch.object(config, 'GEMINI_MODEL', nilai_env):
+                utama, urutan = ai_input._kandidat_model_gemini()
+                self.assertEqual(utama, harapan)
+                self.assertEqual(urutan[0], harapan)
+
+        # 4. 404 pada 3.8-flash jatuh ke 3.5-flash-lite; error non-404 (401) tidak fallback
+        ai_input._gemini_pengganti.clear()
+        url_dicoba = []
+
+        def fake_post_bertingkat(url, **kwargs):
+            url_dicoba.append(url)
+            if 'gemini-3.8-flash' in url:
+                return RespPalsu(404, {'error': {'message': 'not found'}})
+            return RespPalsu(200, {'candidates': [{'content': {'parts': [{'text': 'ok lite'}]}}]})
+
+        with patch.object(config, 'GEMINI_API_KEY', 'k'), \
+             patch.object(config, 'GEMINI_MODEL', 'gemini-3.8-flash'), \
+             patch.object(ai_input.requests, 'post', side_effect=fake_post_bertingkat):
+            self.assertEqual(ai_input._panggil_gemini([{'text': 'hi'}]), 'ok lite')
+            self.assertEqual(len(url_dicoba), 2)
+            self.assertIn('gemini-3.5-flash-lite', url_dicoba[1])
+
+        ai_input._gemini_pengganti.clear()
+        url_401 = []
+
+        def fake_post_401(url, **kwargs):
+            url_401.append(url)
+            return RespPalsu(401, {'error': {'message': 'API key invalid'}})
+
+        with patch.object(config, 'GEMINI_API_KEY', 'k'), \
+             patch.object(config, 'GEMINI_MODEL', 'gemini-3.8-flash'), \
+             patch.object(ai_input.requests, 'post', side_effect=fake_post_401):
+            with self.assertRaises(ai_input.InputAIGagal) as ctx:
+                ai_input._panggil_gemini([{'text': 'hi'}])
+            self.assertIn('401', str(ctx.exception))
+            self.assertEqual(len(url_401), 1)
+
+        # 5. Respons HTTP 200 bukan JSON atau hanya berisi thought part -> InputAIGagal
+        with patch.object(config, 'GEMINI_API_KEY', 'k'), \
+             patch.object(config, 'GEMINI_MODEL', 'gemini-3.8-flash'), \
+             patch.object(ai_input.requests, 'post',
+                          return_value=RespPalsu(200, ValueError('invalid json'), text='<html></html>')):
+            with self.assertRaises(ai_input.InputAIGagal):
+                ai_input._panggil_gemini([{'text': 'hi'}])
+
+        with patch.object(config, 'GEMINI_API_KEY', 'k'), \
+             patch.object(config, 'GEMINI_MODEL', 'gemini-3.8-flash'), \
+             patch.object(ai_input.requests, 'post',
+                          return_value=RespPalsu(200, {'candidates': [{'content': {'parts': [{'thought': True, 'text': 'hmm'}]}}]})):
+            with self.assertRaises(ai_input.InputAIGagal):
+                ai_input._panggil_gemini([{'text': 'hi'}])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

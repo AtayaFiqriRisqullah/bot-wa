@@ -449,25 +449,51 @@ def _ekstrak_json(teks):
     return json.loads(teks)
 
 
+_GEMINI_MODEL_CADANGAN = ('gemini-3.8-flash', 'gemini-3.5-flash-lite')
+_gemini_pengganti = {}   # model_lama -> model_aktif hasil fallback 404
+
+
+def _kandidat_model_gemini():
+    utama = (
+        (config.GEMINI_MODEL or '').strip().lstrip('/').removeprefix('models/').strip('/')
+        or _GEMINI_MODEL_CADANGAN[0]
+    )
+    awal = _gemini_pengganti.get(utama, utama)
+    urutan = [awal]
+    for cadangan in _GEMINI_MODEL_CADANGAN:
+        if cadangan not in urutan:
+            urutan.append(cadangan)
+    return utama, urutan
+
+
 def _panggil_gemini(parts, minta_json=False, timeout=45):
     if requests is None:
         raise InputAIGagal('Library requests belum terpasang.')
     if not config.GEMINI_API_KEY:
         raise InputAIGagal('GEMINI_API_KEY belum diisi di .env')
-    url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
-           f'{config.GEMINI_MODEL}:generateContent')
+
+    # Gemini 3.x/3.8 menghapus parameter sampling (temperature/top_p/top_k).
     body = {'contents': [{'parts': parts}]}
     if minta_json:
-        body['generationConfig'] = {
-            'responseMimeType': 'application/json',
-            'temperature': 0.1,
-        }
-    else:
-        body['generationConfig'] = {'temperature': 0.1}
-    try:
-        r = requests.post(url, params={'key': config.GEMINI_API_KEY}, json=body, timeout=timeout)
-    except requests.exceptions.RequestException as e:
-        raise InputAIGagal(f'Gagal menghubungi Gemini API ({type(e).__name__})') from e
+        body['generationConfig'] = {'responseMimeType': 'application/json'}
+    headers = {'x-goog-api-key': config.GEMINI_API_KEY}
+
+    model_asal, kandidat = _kandidat_model_gemini()
+    r = None
+    for idx, model in enumerate(kandidat):
+        url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
+               f'{model}:generateContent')
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            raise InputAIGagal(f'Gagal menghubungi Gemini API ({type(e).__name__})') from e
+        if r.status_code == 404 and idx + 1 < len(kandidat):
+            print(f'[ai] Model {model} tidak tersedia (404), mencoba {kandidat[idx + 1]}')
+            continue
+        if r.status_code == 200 and model != model_asal:
+            _gemini_pengganti[model_asal] = model
+        break
+
     if r.status_code != 200:
         detail = ''
         try:
@@ -475,12 +501,16 @@ def _panggil_gemini(parts, minta_json=False, timeout=45):
         except ValueError:
             detail = r.text[:160]
         raise InputAIGagal(f'Gemini API error {r.status_code}: {detail}')
-    data = r.json()
+
     try:
-        kandidat = data['candidates'][0]['content']['parts']
-        return ''.join(p.get('text', '') for p in kandidat).strip()
-    except (KeyError, IndexError, TypeError) as e:
+        data = r.json()
+        bagian = data['candidates'][0]['content']['parts']
+        teks = ''.join(p.get('text', '') for p in bagian if not p.get('thought')).strip()
+    except (ValueError, KeyError, IndexError, TypeError) as e:
         raise InputAIGagal('Jawaban Gemini kosong atau tidak dikenali.') from e
+    if not teks:
+        raise InputAIGagal('Jawaban Gemini kosong atau tidak dikenali.')
+    return teks
 
 
 def _panggil_openai_chat(messages, minta_json=False, timeout=45):
@@ -752,10 +782,10 @@ def parse_bahasa_natural_ai(teks, pintasan=None, tanggal_hari_ini=None):
 
     try:
         if provider == 'gemini':
-            jawaban = _panggil_gemini([{'text': prompt}], minta_json=True, timeout=20)
+            jawaban = _panggil_gemini([{'text': prompt}], minta_json=True, timeout=30)
         else:
             jawaban = _panggil_openai_chat([{'role': 'user', 'content': prompt}],
-                                           minta_json=True, timeout=20)
+                                           minta_json=True, timeout=30)
         data = _ekstrak_json(jawaban)
     except (InputAIGagal, ValueError):
         return None

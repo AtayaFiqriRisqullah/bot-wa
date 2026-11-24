@@ -22,10 +22,13 @@ PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID', '')
 APP_SECRET = os.environ.get('APP_SECRET', '')
 
 # Input Cerdas (Scan Struk, Voice Note, Bahasa Natural / LLM Fallback)
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
+GEMINI_MODEL = (
+    os.environ.get('GEMINI_MODEL', '').strip().lstrip('/').removeprefix('models/').strip('/')
+    or 'gemini-3.8-flash'
+)
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '').strip()
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', '').strip() or 'gpt-4o-mini'
 AI_AKTIF = os.environ.get('AI_AKTIF', 'true').strip().lower() not in ('0', 'false', 'no', 'off')
 
 # Sinkronisasi /deadline ke Google Calendar secara otomatis
