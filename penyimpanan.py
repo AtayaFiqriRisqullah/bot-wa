@@ -604,28 +604,28 @@ def ubah_tagihan(ubah):
 
 
 # ---------------------------------------------------------------------------
-# Sinkronisasi tugas Morgana Companion (morgana_sync.json)
+# Sinkronisasi tugas Morgana Companion via Google Sheets (morgana_sync.json)
 # ---------------------------------------------------------------------------
 
 def _normalisasi_morgana_state(data):
     if not isinstance(data, dict):
         data = {}
     tasks = data.get('tasks')
-    outbox = data.get('outbox')
+    selesai_wa = data.get('selesai_wa')
     return {
         'tasks': list(tasks) if isinstance(tasks, list) else [],
-        'outbox': list(outbox) if isinstance(outbox, list) else [],
+        'selesai_wa': dict(selesai_wa) if isinstance(selesai_wa, dict) else {},
         'last_sync': str(data.get('last_sync') or ''),
     }
 
 
 def baca_morgana_sync():
-    """Salinan state sinkronisasi Morgana: {'tasks': [...], 'outbox': [...], 'last_sync': str}."""
+    """Salinan state sinkronisasi Morgana: {'tasks': [...], 'selesai_wa': {...}, 'last_sync': str}."""
     with _kunci_morgana:
         state = _normalisasi_morgana_state(_baca_json(MORGANA_SYNC_FILE))
         return {
             'tasks': [dict(t) for t in state['tasks'] if isinstance(t, dict)],
-            'outbox': [dict(o) for o in state['outbox'] if isinstance(o, dict)],
+            'selesai_wa': dict(state['selesai_wa']),
             'last_sync': state['last_sync'],
         }
 
@@ -640,6 +640,50 @@ def ubah_morgana_sync(ubah):
         if json.dumps(state, ensure_ascii=False, sort_keys=True) != sebelum:
             _tulis_json_atomik(MORGANA_SYNC_FILE, state)
         return hasil
+
+
+def ambil_tugas_morgana_sheet(nama_tab='Morgana'):
+    """Baca daftar deadline tugas dari tab `nama_tab` di Google Sheet utama (SHEET_ID).
+
+    Mengembalikan list[dict] jika tab tersedia, atau None jika tab belum dibuat.
+    Kolom header yang didukung: id, title, deadline, priority, stat, updated_at.
+    """
+    if not SHEET_ID:
+        return None
+    try:
+        ws = _tab(nama_tab)
+    except TabTidakAda:
+        return None
+    baris_semua = ws.get_all_values()
+    if not baris_semua:
+        return []
+
+    header = [str(c).strip().lower() for c in baris_semua[0]]
+    peta = {nama: idx for idx, nama in enumerate(header) if nama}
+    mulai = 1 if ('title' in peta and 'deadline' in peta) else 0
+
+    def _kolom(row, nama, posisi_bawaan):
+        idx = peta.get(nama, posisi_bawaan) if mulai == 1 else posisi_bawaan
+        return str(row[idx]).strip() if idx < len(row) else ''
+
+    hasil = []
+    for row in baris_semua[mulai:]:
+        if not any(str(c).strip() for c in row):
+            continue
+        tid = _kolom(row, 'id', 0)
+        title = _kolom(row, 'title', 1)
+        deadline = _kolom(row, 'deadline', 2)
+        if not tid or not title or not deadline:
+            continue
+        hasil.append({
+            'id': tid,
+            'title': title,
+            'deadline': deadline,
+            'priority': _kolom(row, 'priority', 3) or 'normal',
+            'stat': _kolom(row, 'stat', 4) or 'proficiency',
+            'updated_at': _kolom(row, 'updated_at', 5),
+        })
+    return hasil
 
 
 # ---------------------------------------------------------------------------

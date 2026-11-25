@@ -40,9 +40,11 @@ DEADLINE_KE_KALENDER = os.environ.get('DEADLINE_KE_KALENDER', 'true').strip().lo
 API_HOST = os.environ.get('API_HOST', '127.0.0.1')
 API_PORT = int(os.environ.get('API_PORT', '8000'))
 
-# Sinkronisasi Morgana Companion (Laptop <-> Bot WA Termux)
-# Isi token rahasia yang sama di Settings -> WhatsApp Bot Sync pada Morgana Companion.
-MORGANA_SYNC_TOKEN = os.environ.get('MORGANA_SYNC_TOKEN', '').strip()
+# Sinkronisasi Morgana Companion via Google Sheets (tab khusus di spreadsheet yang sama)
+MORGANA_SHEET_TAB = os.environ.get('MORGANA_SHEET_TAB', 'Morgana').strip() or 'Morgana'
+MORGANA_SYNC_INTERVAL_MENIT = max(
+    1, int(os.environ.get('MORGANA_SYNC_INTERVAL_MENIT', '5') or '5')
+)
 MORGANA_PENGINGAT_AKTIF = os.environ.get('MORGANA_PENGINGAT_AKTIF', 'true').strip().lower() not in (
     '0', 'false', 'no', 'off'
 )

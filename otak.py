@@ -2,6 +2,7 @@ import calendar
 import re
 import traceback
 from datetime import date, datetime, time, timedelta
+from time import monotonic as _waktu_mono
 
 try:
     import requests
@@ -19,6 +20,7 @@ from penyimpanan import (BULAN, GAGAL_JARINGAN, RIWAYAT_MAKS, WIB, RiwayatBeruba
                          TabelPenuh, TabTidakAda,
                          ambil_konfirmasi, ambil_pengeluaran_hari_ini, ambil_riwayat,
                          ambil_saldo, ambil_semua_pengeluaran, ambil_total_kategori,
+                         ambil_tugas_morgana_sheet,
                          baca_deadline, baca_morgana_sync, baca_pengaturan, baca_pengingat_cepat,
                          baca_tagihan, batalkan_terakhir, hapus_konfirmasi,
                          nama_bulan, pengingat_sudah_dicek, sekarang,
@@ -1661,7 +1663,7 @@ def _belum_lewat(d, kini):
 
 
 # ---------------------------------------------------------------------------
-# Sinkronisasi tugas Morgana Companion (/morgana, alias /tugas)
+# Sinkronisasi tugas Morgana Companion via Google Sheets (/morgana, alias /tugas)
 # ---------------------------------------------------------------------------
 
 def _parse_waktu_morgana(teks):
@@ -1690,104 +1692,97 @@ def _waktu_kirim_morgana(tingkat, waktu):
 
 
 _morgana_last_sync_mem = ''
+_morgana_last_poll_mono = 0.0
 
 
-def morgana_status():
-    state = baca_morgana_sync()
-    return {
-        'ok': True,
-        'synced_tasks': len(state['tasks']),
-        'pending_outbox': len(state['outbox']),
-        'last_sync': _morgana_last_sync_mem or state['last_sync'],
-        'server_time': sekarang().isoformat(timespec='seconds'),
-    }
+def sinkron_morgana_dari_sheet(paksa=False):
+    """Tarik daftar deadline aktif dari tab Google Sheets (default: 'Morgana') secara berkala.
 
-
-def morgana_ambil_outbox():
-    state = baca_morgana_sync()
-    return {
-        'ok': True,
-        'items': list(state['outbox']),
-        'server_time': sekarang().isoformat(timespec='seconds'),
-    }
-
-
-def morgana_terima_sync(tasks_masuk, ack_ids=None):
-    """ACK outbox selesai yang sudah disimpan Morgana, lalu sinkronkan daftar deadline aktif.
-
-    Tugas yang ID-nya masih ada di outbox (belum di-ACK) tidak akan dihidupkan kembali,
-    sehingga tidak ada race condition jika /morgana selesai dikirim tepat di tengah sinkronisasi.
+    Mengembalikan dict hasil {'ok': bool, 'status': 'synced'|'skipped'|'no_tab'|'error', 'count': int}.
+    Tidak melempar exception agar tidak mengganggu pengingat lain saat koneksi Google bermasalah.
     """
-    global _morgana_last_sync_mem
+    global _morgana_last_sync_mem, _morgana_last_poll_mono
+    if not config.MORGANA_PENGINGAT_AKTIF or not config.SHEET_ID:
+        return {'ok': False, 'status': 'skipped', 'count': 0}
+
+    interval_detik = max(60, int(config.MORGANA_SYNC_INTERVAL_MENIT) * 60)
+    mono_kini = _waktu_mono()
+    if not paksa and _morgana_last_poll_mono > 0 and (mono_kini - _morgana_last_poll_mono) < interval_detik:
+        return {'ok': True, 'status': 'skipped', 'count': len(baca_morgana_sync()['tasks'])}
+
+    _morgana_last_poll_mono = mono_kini
+    try:
+        rows = ambil_tugas_morgana_sheet(config.MORGANA_SHEET_TAB)
+    except Exception as e:
+        traceback.print_exc()
+        # Tunggu minimal 60 detik sebelum mencoba tarik ulang saat jaringan bermasalah
+        _morgana_last_poll_mono = mono_kini - max(0, interval_detik - 60)
+        return {'ok': False, 'status': 'error', 'count': 0, 'galat': type(e).__name__}
+
+    if rows is None:
+        return {'ok': False, 'status': 'no_tab', 'count': 0}
+
     kini = sekarang()
     kini_iso = kini.isoformat(timespec='seconds')
     batas_simpan = kini - timedelta(hours=MORGANA_OVERDUE_SIMPAN_JAM)
-    ack_set = {str(i).strip() for i in (ack_ids or ()) if str(i).strip()}
 
     def proses(state):
         sebelum_tasks = list(state['tasks'])
-        sebelum_outbox = list(state['outbox'])
-        if ack_set:
-            state['outbox'] = [
-                o for o in state['outbox']
-                if str(o.get('task_id') or '').strip() not in ack_set
-            ]
-        outbox_ids = {
-            str(o.get('task_id') or '').strip()
-            for o in state['outbox']
-            if isinstance(o, dict)
-        }
+        sebelum_selesai = dict(state['selesai_wa'])
         lama_by_id = {
             str(t.get('id') or '').strip(): t
             for t in state['tasks']
             if isinstance(t, dict) and t.get('id')
         }
+        selesai_wa = dict(state['selesai_wa'])
 
         baru = []
         seen = set()
-        for item in list(tasks_masuk or ())[:500]:
+        sheet_ids = {}
+        for item in list(rows)[:500]:
             if not isinstance(item, dict):
                 continue
             tid = str(item.get('id') or '').strip()
             judul = str(item.get('title') or '').strip()[:MAKS_JUDUL_DEADLINE]
             waktu = _parse_waktu_morgana(item.get('deadline'))
-            if (not tid or tid in seen or tid in outbox_ids
-                    or not judul or waktu is None or waktu < batas_simpan):
+            if not tid or tid in seen or not judul or waktu is None or waktu < batas_simpan:
                 continue
             seen.add(tid)
             waktu_iso = waktu.isoformat(timespec='seconds')
+            sheet_ids[tid] = waktu_iso
+            # Jika pengguna sudah menandai selesai dari WA untuk deadline yang sama, jangan ingatkan lagi
+            if selesai_wa.get(tid) == waktu_iso:
+                continue
             lama = lama_by_id.get(tid)
             if lama is not None and lama.get('deadline') == waktu_iso:
                 terkirim = [k for k in (lama.get('terkirim') or []) if isinstance(k, str)]
             else:
-                # Tugas baru atau jadwal deadline berubah: tingkat yang sudah lewat dianggap terkirim
-                # agar tidak membanjiri WA dengan notifikasi basi saat pertama kali sinkron.
+                # Tugas baru atau deadline berubah: tingkat yang sudah lewat dianggap terkirim
                 terkirim = [t[0] for t in TINGKAT_MORGANA if _waktu_kirim_morgana(t, waktu) <= kini]
             baru.append({
                 'id': tid,
                 'title': judul,
                 'deadline': waktu_iso,
-                'priority': 'high' if item.get('priority') == 'high' else 'normal',
+                'priority': 'high' if str(item.get('priority') or '').lower() == 'high' else 'normal',
                 'stat': str(item.get('stat') or 'proficiency'),
                 'updated_at': str(item.get('updated_at') or ''),
                 'terkirim': terkirim,
             })
 
-        state['tasks'] = baru
-        # Hanya tulis last_sync ke disk saat tasks/outbox berubah (atau belum pernah tersimpan)
-        # agar tidak menulis flash storage Termux berulang kali saat tidak ada perubahan.
-        if state['tasks'] != sebelum_tasks or state['outbox'] != sebelum_outbox or not state.get('last_sync'):
-            state['last_sync'] = kini_iso
-        return {
-            'ok': True,
-            'synced_count': len(baru),
-            'remaining_outbox': len(state['outbox']),
-            'server_time': kini_iso,
+        # Bersihkan entri selesai_wa yang sudah dihapus Morgana dari sheet atau diubah deadline-nya
+        selesai_baru = {
+            tid: dl for tid, dl in selesai_wa.items()
+            if sheet_ids.get(tid) == dl
         }
+        state['tasks'] = baru
+        state['selesai_wa'] = selesai_baru
+        if state['tasks'] != sebelum_tasks or state['selesai_wa'] != sebelum_selesai or not state.get('last_sync'):
+            state['last_sync'] = kini_iso
+        return len(baru)
 
-    hasil = ubah_morgana_sync(proses)
+    jumlah = ubah_morgana_sync(proses)
     _morgana_last_sync_mem = kini_iso
-    return hasil
+    return {'ok': True, 'status': 'synced', 'count': jumlah}
 
 
 def _morgana_tasks_aktif():
@@ -1806,6 +1801,7 @@ def _morgana_tasks_aktif():
 
 
 def daftar_morgana():
+    sinkron_morgana_dari_sheet(paksa=False)
     daftar, last_sync = _morgana_tasks_aktif()
     if not daftar:
         info_sync = ''
@@ -1813,8 +1809,9 @@ def daftar_morgana():
             dt_sync = _parse_waktu_morgana(last_sync)
             if dt_sync is not None:
                 info_sync = '\nSinkron terakhir: ' + teks_waktu(dt_sync)
-        return ('🐱 Belum ada deadline tugas Morgana yang aktif.' + info_sync +
-                '\nAktifkan WhatsApp Bot Sync di Settings Morgana untuk sinkron otomatis.')
+        return (f'🐱 Belum ada deadline tugas Morgana yang aktif di tab "{config.MORGANA_SHEET_TAB}".'
+                + info_sync +
+                '\nKirim /morgana sync untuk menarik ulang dari Google Sheets.')
     kini = sekarang()
     baris = ['🐱 Tugas Morgana (' + str(len(daftar)) + ')']
     for nomor, (waktu, t) in enumerate(daftar, 1):
@@ -1825,7 +1822,7 @@ def daftar_morgana():
         dt_sync = _parse_waktu_morgana(last_sync)
         if dt_sync is not None:
             baris.append('Sinkron terakhir: ' + teks_waktu(dt_sync))
-    baris.append('Tandai selesai: /morgana selesai <nomor atau judul>')
+    baris.append('Tarik ulang: /morgana sync · Hentikan pengingat: /morgana selesai <no/judul>')
     return '\n'.join(baris)
 
 
@@ -1856,34 +1853,38 @@ def selesaikan_morgana(kunci):
     _, terpilih = cocok[0]
     tid = str(terpilih['id'])
     judul = str(terpilih['title'])
-    done_iso = sekarang().isoformat(timespec='seconds')
+    dl_iso = str(terpilih.get('deadline') or '')
 
     def tandai(state):
         state['tasks'] = [t for t in state['tasks'] if str(t.get('id') or '') != tid]
-        outbox = [o for o in state['outbox'] if str(o.get('task_id') or '') != tid]
-        outbox.append({
-            'task_id': tid,
-            'title': judul,
-            'done_at': done_iso,
-        })
-        state['outbox'] = outbox
+        if dl_iso:
+            state['selesai_wa'][tid] = dl_iso
 
     ubah_morgana_sync(tandai)
-    return ('✅ Tugas Morgana ditandai selesai: ' + judul +
-            '\n🔄 Status selesai akan otomatis dicentang di Morgana saat laptop menyala.')
+    return ('✅ Pengingat WA untuk tugas Morgana dihentikan: ' + judul +
+            '\n(Jangan lupa centang juga di Morgana saat membuka laptop.)')
 
 
 def perintah_morgana(argumen):
-    """/morgana | /morgana selesai <nomor atau judul>"""
+    """/morgana | /morgana sync | /morgana selesai <nomor atau judul>"""
     bagian = argumen.split()
     if not bagian:
         return daftar_morgana()
     sub = bagian[0].lower()
-    if sub in ('selesai', 'done', 'hapus', 'centang'):
+    if sub in ('sync', 'sinkron', 'tarik', 'refresh'):
+        res = sinkron_morgana_dari_sheet(paksa=True)
+        if res['status'] == 'no_tab':
+            return (f'⚠️ Tab "{config.MORGANA_SHEET_TAB}" belum ditemukan di Google Sheet.\n'
+                    'Aktifkan Google Sheets Sync di Settings Morgana lalu klik TEST / SYNC NOW.')
+        if not res['ok']:
+            return '⚠️ Gagal menarik data dari Google Sheets (' + str(res.get('galat', 'error')) + ').'
+        return f'🔄 Sinkron tab "{config.MORGANA_SHEET_TAB}" selesai: {res["count"]} tugas aktif.\n\n' + daftar_morgana()
+    if sub in ('selesai', 'done', 'hapus', 'centang', 'bisukan'):
         return selesaikan_morgana(' '.join(bagian[1:]))
     return ('Perintah /morgana:\n'
             '• /morgana — lihat deadline tugas dari Morgana\n'
-            '• /morgana selesai <nomor atau judul> — tandai tugas selesai (sinkron ke laptop)')
+            '• /morgana sync — tarik ulang terbaru dari Google Sheets\n'
+            '• /morgana selesai <nomor atau judul> — hentikan pengingat WA tugas tersebut')
 
 
 def _teks_pengingat_morgana(task, waktu, tingkat, kini):
@@ -1905,9 +1906,11 @@ def _teks_pengingat_morgana(task, waktu, tingkat, kini):
 
 
 def pengingat_morgana():
-    """Untuk penjadwal: pengingat bertahap tugas Morgana (H-3, H-1, 3 jam, 1 jam, tepat waktu)."""
+    """Untuk penjadwal: tarik berkala dari Google Sheets lalu kirim pengingat bertahap
+    (H-3, H-1, 3 jam, 1 jam, tepat waktu)."""
     if not config.MORGANA_PENGINGAT_AKTIF:
         return None
+    sinkron_morgana_dari_sheet(paksa=False)
     kini = sekarang()
     batas_simpan = kini - timedelta(hours=MORGANA_OVERDUE_SIMPAN_JAM)
     batas_due = timedelta(hours=MORGANA_DUE_GRACE_JAM)
@@ -1943,6 +1946,7 @@ def pengingat_morgana():
 def teks_morgana_pagi():
     if not config.MORGANA_PENGINGAT_AKTIF:
         return None
+    sinkron_morgana_dari_sheet(paksa=False)
     daftar, _ = _morgana_tasks_aktif()
     daftar = daftar[:JUMLAH_DEADLINE_PAGI]
     if not daftar:
@@ -2431,7 +2435,7 @@ def perintah_bantuan(argumen):
             '⏰ Produktivitas & Catatan:\n'
             '• /ingatkan <30m|21:00|besok 09:00> <pesan> (alias /remind)\n'
             '• /deadline <judul> <tgl> <jam> (otomatis sinkron ke Google Calendar)\n'
-            '• /morgana [selesai <no/judul>] (tugas tersinkron dari Morgana, alias /tugas)\n'
+            '• /morgana [sync | selesai <no/judul>] (tugas Morgana via Sheets, alias /tugas)\n'
             '• /todo <tgl> <jam> <judul>\n'
             '• /pagi · /malam\n'
             '• /catat (alias /ide) · /catatan · /cari\n\n'
