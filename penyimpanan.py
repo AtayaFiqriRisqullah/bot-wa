@@ -71,6 +71,9 @@ TAGIHAN_FILE = os.path.join(_DIREKTORI, 'tagihan.json')
 # Draft menunggu konfirmasi (hasil scan struk foto atau transkrip voice note).
 KONFIRMASI_FILE = os.path.join(_DIREKTORI, 'konfirmasi.json')
 
+# Daftar deadline tugas yang disinkronkan dari Morgana Companion + antrean outbox selesai.
+MORGANA_SYNC_FILE = os.path.join(_DIREKTORI, 'morgana_sync.json')
+
 # Gangguan jaringan sesaat: koneksi di-reset, sinyal HP pindah, timeout, dan sejenisnya.
 # Panggilan ke Google yang gagal karena ini aman diulang, sebab semua panggilan di file
 # ini idempotent (membaca, menulis ke rentang yang sama persis, atau mengosongkan rentang),
@@ -126,6 +129,7 @@ _kunci_deadline = threading.Lock()
 _kunci_pengingat_cepat = threading.Lock()
 _kunci_tagihan = threading.Lock()
 _kunci_konfirmasi = threading.Lock()
+_kunci_morgana = threading.Lock()
 
 
 def _dapatkan_buku():
@@ -597,6 +601,45 @@ def baca_tagihan():
 def ubah_tagihan(ubah):
     """Ubah daftar tagihan rutin secara atomik."""
     return _ubah_daftar_json(TAGIHAN_FILE, _kunci_tagihan, ubah)
+
+
+# ---------------------------------------------------------------------------
+# Sinkronisasi tugas Morgana Companion (morgana_sync.json)
+# ---------------------------------------------------------------------------
+
+def _normalisasi_morgana_state(data):
+    if not isinstance(data, dict):
+        data = {}
+    tasks = data.get('tasks')
+    outbox = data.get('outbox')
+    return {
+        'tasks': list(tasks) if isinstance(tasks, list) else [],
+        'outbox': list(outbox) if isinstance(outbox, list) else [],
+        'last_sync': str(data.get('last_sync') or ''),
+    }
+
+
+def baca_morgana_sync():
+    """Salinan state sinkronisasi Morgana: {'tasks': [...], 'outbox': [...], 'last_sync': str}."""
+    with _kunci_morgana:
+        state = _normalisasi_morgana_state(_baca_json(MORGANA_SYNC_FILE))
+        return {
+            'tasks': [dict(t) for t in state['tasks'] if isinstance(t, dict)],
+            'outbox': [dict(o) for o in state['outbox'] if isinstance(o, dict)],
+            'last_sync': state['last_sync'],
+        }
+
+
+def ubah_morgana_sync(ubah):
+    """Baca state sinkronisasi Morgana, jalankan ubah(state) di tempat, lalu simpan
+    secara atomik jika isinya berubah. Mengembalikan nilai balik ubah(state)."""
+    with _kunci_morgana:
+        state = _normalisasi_morgana_state(_baca_json(MORGANA_SYNC_FILE))
+        sebelum = json.dumps(state, ensure_ascii=False, sort_keys=True)
+        hasil = ubah(state)
+        if json.dumps(state, ensure_ascii=False, sort_keys=True) != sebelum:
+            _tulis_json_atomik(MORGANA_SYNC_FILE, state)
+        return hasil
 
 
 # ---------------------------------------------------------------------------

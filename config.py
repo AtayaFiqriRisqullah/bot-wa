@@ -39,3 +39,10 @@ DEADLINE_KE_KALENDER = os.environ.get('DEADLINE_KE_KALENDER', 'true').strip().lo
 # Server API Lokal (Python <-> Node.js Baileys)
 API_HOST = os.environ.get('API_HOST', '127.0.0.1')
 API_PORT = int(os.environ.get('API_PORT', '8000'))
+
+# Sinkronisasi Morgana Companion (Laptop <-> Bot WA Termux)
+# Isi token rahasia yang sama di Settings -> WhatsApp Bot Sync pada Morgana Companion.
+MORGANA_SYNC_TOKEN = os.environ.get('MORGANA_SYNC_TOKEN', '').strip()
+MORGANA_PENGINGAT_AKTIF = os.environ.get('MORGANA_PENGINGAT_AKTIF', 'true').strip().lower() not in (
+    '0', 'false', 'no', 'off'
+)
